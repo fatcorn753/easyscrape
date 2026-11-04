@@ -170,3 +170,32 @@ def test_pick_frame_rejects_bad_url(ui):
 def test_pick_frame_foreign_host(ui, target):
     status, _, _ = _request(ui, "GET", "/pick-frame?url=" + target + "/list.html", host="evil.example")
     assert status == 403
+
+
+def test_bad_selector_shows_message_not_disconnect(ui, target):
+    values = {"urls": f"{target}/list.html", "item": "", "fields": "t=h2[", "delay": "1"}
+    status, _, body = _request(ui, "POST", "/run", values)
+    assert status == 200
+    assert "セレクタが正しくありません" in body
+
+
+def test_foreign_origin_rejected(ui, target):
+    conn = http.client.HTTPConnection("127.0.0.1", ui.server_port, timeout=10)
+    conn.request(
+        "POST", "/run",
+        body=urllib.parse.urlencode({"urls": f"{target}/list.html", "fields": "t=h2"}),
+        headers={
+            "Host": f"127.0.0.1:{ui.server_port}",
+            "Origin": "https://evil.example",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert conn.getresponse().status == 403
+    conn.close()
+
+
+def test_cross_site_fetch_metadata_rejected(ui):
+    conn = http.client.HTTPConnection("127.0.0.1", ui.server_port, timeout=10)
+    conn.request("GET", "/", headers={"Host": f"127.0.0.1:{ui.server_port}", "Sec-Fetch-Site": "cross-site"})
+    assert conn.getresponse().status == 403
+    conn.close()

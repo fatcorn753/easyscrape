@@ -165,7 +165,11 @@ def run(args: argparse.Namespace) -> int:
 
     warn_personal_info(rows)
     fmt = args.format or guess_format(args.output)
-    write_rows(rows, args.output, fmt)
+    try:
+        write_rows(rows, args.output, fmt)
+    except OSError as exc:
+        print(f"エラー: 保存できませんでした: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     if args.output:
         print(f"保存: {args.output}（{len(rows)} 行）", file=sys.stderr)
     return EXIT_PARTIAL if failed else EXIT_OK

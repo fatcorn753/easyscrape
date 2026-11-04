@@ -274,3 +274,27 @@ def test_extract_rows_skips_empty_items():
     html = "<table><tr><th>発表日</th></tr><tr><td class='d'>2026年11月4日</td></tr></table>"
     rows = extract_rows(html, [FieldSpec.parse("date=td.d")], "tr")
     assert rows == [{"date": "2026年11月4日"}]
+
+
+def test_bad_selector_is_error_not_crash():
+    from easyscrape.job import ScrapeJob, run_job
+
+    result = run_job(ScrapeJob(urls=[], fields=[FieldSpec.parse("t=h2[")]))
+    assert result.rows == []
+    with pytest.raises(ValueError, match="セレクタが正しくありません"):
+        extract_rows("<h2>x</h2>", [FieldSpec.parse("t=h2[")], None)
+
+
+def test_json_detected_by_body_when_content_type_is_text():
+    rows = extract_json_rows('{"items":[{"t":"a"}]}', [FieldSpec.parse("t=t")], "items")
+    assert rows == [{"t": "a"}]
+    from easyscrape.extract import looks_like_json
+
+    assert looks_like_json('{"a":1}', "text/plain")
+    assert not looks_like_json("<html>", "text/html")
+
+
+def test_output_to_directory_is_clean_error(site, tmp_path, capsys):
+    code = main([site + "/index.html", "--field", "title=h2", "-o", str(tmp_path), "--force", "--delay", "0"])
+    assert code == 2
+    assert "保存できませんでした" in capsys.readouterr().err

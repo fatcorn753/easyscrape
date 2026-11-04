@@ -48,11 +48,19 @@ def _value(node: Tag, attr: str | None) -> str:
     return str(value)
 
 
+def _select(scope: BeautifulSoup | Tag, selector: str, many: bool = False):
+    """CSS セレクタを適用する。構文が不正なら利用者向けの ValueError にする。"""
+    try:
+        return scope.select(selector) if many else scope.select_one(selector)
+    except Exception as exc:  # soupsieve の構文エラーなど
+        raise ValueError(f"セレクタが正しくありません: {selector}") from exc
+
+
 def extract_record(soup: BeautifulSoup | Tag, fields: list[FieldSpec]) -> dict[str, str]:
     """各フィールドについて最初に一致した要素の値を取る。一致しなければ空文字。"""
     record: dict[str, str] = {}
     for spec in fields:
-        node = soup.select_one(spec.selector)
+        node = _select(soup, spec.selector)
         record[spec.name] = _value(node, spec.attr) if node is not None else ""
     return record
 
@@ -77,6 +85,16 @@ def _json_text(value: object) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def looks_like_json(text: str, content_type: str) -> bool:
+    """Content-Type が JSON、または本文が { か [ で始まるなら JSON とみなす。
+
+    JSON を text/plain で返す API があるため、Content-Type だけでは判定しない。
+    """
+    if "json" in content_type.lower():
+        return True
+    return text.lstrip()[:1] in ("{", "[")
 
 
 def extract_json_rows(text: str, fields: list[FieldSpec], records_path: str | None) -> list[dict[str, str]]:
@@ -107,5 +125,5 @@ def extract_rows(html: str, fields: list[FieldSpec], item_selector: str | None) 
     if item_selector is None:
         return [extract_record(soup, fields)]
     # 一覧の見出し行など、どの項目も取れなかった要素は行にしない
-    rows = [extract_record(item, fields) for item in soup.select(item_selector)]
+    rows = [extract_record(item, fields) for item in _select(soup, item_selector, many=True)]
     return [row for row in rows if any(row.values())]

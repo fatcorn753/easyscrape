@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
-from easyscrape.extract import FieldSpec, extract_json_rows, extract_rows
+from easyscrape.extract import FieldSpec, extract_json_rows, extract_rows, looks_like_json
 from easyscrape.fetch import FetchError, Fetcher
 
 
@@ -37,15 +37,16 @@ def run_job(job: ScrapeJob, on_progress: Callable[[str], None] | None = None) ->
         except FetchError as exc:
             result.errors.append(f"スキップ: {exc}")
             continue
+        is_json = looks_like_json(body, content_type)
         try:
-            if "json" in content_type:
+            if is_json:
                 page_rows = extract_json_rows(body, job.fields, job.records)
             else:
                 page_rows = extract_rows(body, job.fields, job.item)
         except ValueError as exc:
             result.errors.append(f"スキップ: {url}: {exc}")
             continue
-        if "json" not in content_type:
+        if not is_json:
             # 相対 URL（/a/b.html など）を、取得元のページを基準に絶対 URL へ直す
             link_fields = [f.name for f in job.fields if f.attr in ("href", "src")]
             for row in page_rows:

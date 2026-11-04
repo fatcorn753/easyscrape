@@ -442,7 +442,13 @@ class Handler(BaseHTTPRequestHandler):
     # 別サイトのページから localhost へ送られるリクエストを拒否する
     def _host_ok(self) -> bool:
         host = self.headers.get("Host", "")
-        return host in {f"{HOST}:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+        if host not in {f"{HOST}:{self.server.server_port}", f"localhost:{self.server.server_port}"}:
+            return False
+        # 別サイトのページからの要求（DNS の書き換え・CSRF）を拒否する
+        origin = self.headers.get("Origin")
+        if origin and urllib.parse.urlsplit(origin).hostname not in (HOST, "localhost"):
+            return False
+        return self.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
 
     def _send(self, status: int, payload: bytes, content_type: str = "text/html; charset=utf-8", extra: dict[str, str] | None = None) -> None:
         self.send_response(status)
@@ -498,12 +504,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, _page("403", "<h1>403</h1>"))
             return
         values = self._read_form()
-        if self.path == "/run":
-            self._run(values)
-        elif self.path == "/download":
-            self._download(values)
-        else:
-            self._send(404, _page("404", "<h1>404</h1>"))
+        try:
+            if self.path == "/run":
+                self._run(values)
+            elif self.path == "/download":
+                self._download(values)
+            else:
+                self._send(404, _page("404", "<h1>404</h1>"))
+        except Exception as exc:  # 予期しない失敗でも接続を切らず、理由を画面に出す
+            print(f"内部エラー: {exc!r}", file=sys.stderr)
+            self._send(500, form_page(values, [f"処理中に問題が発生しました: {exc}"]))
 
     def _run(self, values: dict[str, str]) -> None:
         form_input = parse_input(values)
