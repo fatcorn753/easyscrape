@@ -5,10 +5,12 @@ description = "URL と CSS セレクタを指定するだけで、Web ページ�
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.15.0",
+    "certifi>=2026.10.23",
 ]
 
 [project.scripts]
 easyscrape = "easyscrape.cli:main"
+easyscrape-ui = "easyscrape.web:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

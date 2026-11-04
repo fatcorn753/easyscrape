@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import TextIO
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-# 日本の携帯・固定電話の表記ゆれをざっくり拾う（検出は警告のみ）
-PHONE_RE = re.compile(r"0\d{1,4}[-(]?\d{1,4}[-)]?\d{3,4}")
+# 日本の電話番号（ハイフン区切り、または 10〜11 桁の連続）。
+# 商品コードや ISBN など、前後に数字・英字・ハイフンが続く数列は除外する
+PHONE_RE = re.compile(r"(?<![\w-])(?:\(?0\d{1,4}\)?[ -]?\d{1,4}-\d{4}|0\d{9,10})(?![\w-])")
 
 
 def warn_personal_info(rows: list[dict[str, str]], stream: TextIO = sys.stderr) -> None:

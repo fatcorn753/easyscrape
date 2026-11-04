@@ -1,12 +1,13 @@
 import json
 import threading
+import urllib.robotparser
 from functools import partial
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
 
 import pytest
 
 from easyscrape.cli import main
-from easyscrape.extract import FieldSpec, extract_rows
+from easyscrape.extract import FieldSpec, extract_json_rows, extract_rows
 from easyscrape.fetch import Fetcher, RobotsDenied
 from easyscrape.output import render, warn_personal_info
 
@@ -79,6 +80,28 @@ def test_warn_personal_info(capsys):
     assert "電話番号" in out
 
 
+@pytest.mark.parametrize("value", ["090-1234-5678", "0312345678", "(03) 1234-5678"])
+def test_phone_detected(value):
+    import io
+
+    buf = io.StringIO()
+    warn_personal_info([{"c": value}], stream=buf)
+    assert "電話番号" in buf.getvalue()
+
+
+@pytest.mark.parametrize("value", [
+    "/product/322605001487/",  # 商品コード
+    "9784041175361",           # ISBN-13
+    "https://example.com/p/12345678901234",
+])
+def test_phone_not_detected(value):
+    import io
+
+    buf = io.StringIO()
+    warn_personal_info([{"c": value}], stream=buf)
+    assert buf.getvalue() == ""
+
+
 def test_robots_denied(site):
     fetcher = Fetcher(delay=0)
     with pytest.raises(RobotsDenied):
@@ -99,7 +122,7 @@ def test_cli_end_to_end_csv(site, tmp_path):
     assert code == 0
     lines = out.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "url,title,link"
-    assert lines[1].endswith(",記事A,/a")
+    assert lines[1].endswith(",記事A," + site + "/a")  # 相対 URL は絶対 URL に直る
     assert len(lines) == 3
 
 
@@ -129,3 +152,117 @@ def test_cli_usage_errors(capsys):
     assert main([]) == 2
     assert main(["https://example.com"]) == 2
     assert main(["https://example.com", "--field", "bad"]) == 2
+
+
+JSON_BODY = {
+    "count": {"book": "2"},
+    "result": {
+        "all": [
+            {"itemCode": "1", "title": "天地明察 上", "person": "冲方丁", "release_date": "2026-10-23"},
+            {"itemCode": "2", "title": "天地明察 下", "person": "冲方丁", "release_date": "2026-10-23"},
+        ]
+    },
+}
+
+
+@pytest.fixture
+def json_api():
+    """POST のフォーム値を受け取り、JSON を返すローカル API。"""
+    import json as _json
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            body = _json.dumps(JSON_BODY, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a, **k):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/api"
+    server.shutdown()
+
+
+def test_extract_json_rows_records_path():
+    text = json.dumps(JSON_BODY, ensure_ascii=False)
+    fields = [FieldSpec.parse("title=title"), FieldSpec.parse("date=release_date")]
+    rows = extract_json_rows(text, fields, "result.all")
+    assert rows == [
+        {"title": "天地明察 上", "date": "2026-10-23"},
+        {"title": "天地明察 下", "date": "2026-10-23"},
+    ]
+
+
+def test_extract_json_rows_missing_and_nested():
+    text = json.dumps({"a": [{"b": {"c": 1}}, {"b": None}]})
+    fields = [FieldSpec.parse("c=b.c"), FieldSpec.parse("first=a.0.b.c")]
+    assert extract_json_rows(text, fields, "a") == [
+        {"c": "1", "first": ""},
+        {"c": "", "first": ""},
+    ]
+
+
+def test_extract_json_rows_bad_records_path():
+    with pytest.raises(ValueError):
+        extract_json_rows(json.dumps(JSON_BODY), [FieldSpec.parse("t=title")], "result.nope")
+
+
+def test_cli_json_post_end_to_end(json_api, tmp_path):
+    out = tmp_path / "api.csv"
+    code = main([
+        json_api,
+        "--data", "pageno=1",
+        "--data", "releaseDate=1",
+        "--records", "result.all",
+        "--field", "title=title",
+        "--field", "person=person",
+        "-o", str(out),
+        "--delay", "0",
+    ])
+    assert code == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "url,title,person"
+    assert lines[1].endswith(",天地明察 上,冲方丁")
+    assert len(lines) == 3
+
+
+def test_crawl_delay_respected():
+    fetcher = Fetcher(delay=1.0)
+    parser = urllib.robotparser.RobotFileParser()
+    parser.parse(["User-agent: *", "Crawl-delay: 20"])
+    fetcher._robots["https://example.test"] = parser
+    assert fetcher._interval("https://example.test/a") == 20.0
+
+
+def test_decode_body_charsets():
+    from easyscrape.fetch import decode_body
+
+    sjis = "総務省 報道資料".encode("cp932")
+    assert decode_body(sjis, "text/html; charset=Shift_JIS") == "総務省 報道資料"
+    meta = b'<meta charset="Shift_JIS"><p>' + sjis + b"</p>"
+    assert "総務省" in decode_body(meta, "text/html")
+    utf8 = "天地明察".encode("utf-8")
+    assert decode_body(utf8, "text/html; charset=utf-8") == "天地明察"
+    assert decode_body(utf8, "") == "天地明察"
+
+
+def test_run_job_continues_after_failed_url(site):
+    from easyscrape.job import ScrapeJob, run_job
+
+    job = ScrapeJob(
+        urls=["http://127.0.0.1:9/unreachable", site + "/index.html"],
+        fields=[FieldSpec.parse("title=h2")],
+        item="li.article",
+        delay=0,
+    )
+    result = run_job(job)
+    assert len(result.errors) == 1
+    assert [r["title"] for r in result.rows] == ["記事A", "記事B"]

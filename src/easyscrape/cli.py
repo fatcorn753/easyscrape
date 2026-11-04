@@ -6,8 +6,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from easyscrape.extract import FieldSpec, extract_rows
-from easyscrape.fetch import FetchError, Fetcher
+from easyscrape.extract import FieldSpec
+from easyscrape.job import ScrapeJob, run_job
 from easyscrape.output import guess_format, warn_personal_info, write_rows
 
 EXIT_OK = 0
@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="名前=セレクタ[@属性]",
-        help="取り出す項目。@属性 を付けると属性値、付けなければテキスト",
+        help="取り出す項目。HTML は CSS セレクタ（@属性で属性値）、JSON はドット区切りのキーパス",
     )
     parser.add_argument(
         "--item",
@@ -41,12 +41,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="1 件分の要素を指定する。指定すると一致する要素ごとに 1 行。"
         "省略するとページ全体で 1 行",
     )
+    parser.add_argument(
+        "--data",
+        action="append",
+        default=[],
+        metavar="キー=値",
+        help="POST のフォーム値（指定すると POST で送る）。JSON 検索 API 向け",
+    )
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="名前: 値",
+        help="追加の HTTP ヘッダー（例: 'X-Requested-With: XMLHttpRequest'）",
+    )
+    parser.add_argument(
+        "--records",
+        metavar="パス",
+        help="JSON 応答で行の配列を指すドット区切りのパス（例: result.all）",
+    )
     parser.add_argument("-o", "--output", metavar="ファイル", help="出力先（.json で JSON、それ以外は CSV）。省略で標準出力")
     parser.add_argument("--format", choices=["csv", "json"], help="出力形式を拡張子によらず指定する")
     parser.add_argument("--delay", type=float, default=1.0, help="同じホストへの連続アクセスの間隔（秒, 既定 1.0）")
     parser.add_argument("--force", action="store_true", help="出力先が既にあっても上書きする")
     parser.add_argument("-i", "--interactive", action="store_true", help="対話モードで設定を入力する")
     return parser
+
+
+def _parse_form(items: list[str]) -> dict[str, str]:
+    form: dict[str, str] = {}
+    for text in items:
+        if "=" not in text:
+            raise ValueError(f"'キー=値' の形式で指定してください: {text}")
+        key, value = text.split("=", 1)
+        form[key.strip()] = value
+    return form
+
+
+def _parse_headers(items: list[str]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for text in items:
+        if ":" not in text:
+            raise ValueError(f"'名前: 値' の形式で指定してください: {text}")
+        name, value = text.split(":", 1)
+        headers[name.strip()] = value.strip()
+    return headers
 
 
 def _ask(prompt: str) -> str:
@@ -75,6 +114,9 @@ def interactive_config() -> argparse.Namespace:
         format=None,
         delay=1.0,
         force=False,
+        data=[],
+        header=[],
+        records=None,
     )
 
 
@@ -95,19 +137,27 @@ def run(args: argparse.Namespace) -> int:
         print(f"エラー: {args.output} は既に存在します。--force で上書きしてください。", file=sys.stderr)
         return EXIT_USAGE
 
-    fetcher = Fetcher(delay=args.delay)
-    rows: list[dict[str, str]] = []
-    failed = 0
-    for url in args.urls:
-        try:
-            html = fetcher.get_html(url)
-        except FetchError as exc:
-            print(f"スキップ: {exc}", file=sys.stderr)
-            failed += 1
-            continue
-        for row in extract_rows(html, fields, args.item):
-            rows.append({"url": url, **row})
-        print(f"取得: {url}（{len(rows)} 行 累計）", file=sys.stderr)
+    try:
+        form = _parse_form(args.data)
+        headers = _parse_headers(args.header)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    job = ScrapeJob(
+        urls=args.urls,
+        fields=fields,
+        item=args.item,
+        records=args.records,
+        form=form,
+        headers=headers,
+        delay=args.delay,
+    )
+    result = run_job(job, on_progress=lambda msg: print(msg, file=sys.stderr))
+    for error in result.errors:
+        print(error, file=sys.stderr)
+    failed = len(result.errors)
+    rows = result.rows
 
     if not rows:
         print("結果が 0 行でした。セレクタを確認してください。", file=sys.stderr)
