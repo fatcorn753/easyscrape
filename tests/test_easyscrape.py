@@ -32,6 +32,7 @@ def site(tmp_path):
     thread.start()
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
+    server.server_close()
 
 
 def test_field_parse_text_and_attr():
@@ -189,6 +190,7 @@ def json_api():
     thread.start()
     yield f"http://127.0.0.1:{server.server_address[1]}/api"
     server.shutdown()
+    server.server_close()
 
 
 def test_extract_json_rows_records_path():
@@ -266,3 +268,9 @@ def test_run_job_continues_after_failed_url(site):
     result = run_job(job)
     assert len(result.errors) == 1
     assert [r["title"] for r in result.rows] == ["記事A", "記事B"]
+
+
+def test_extract_rows_skips_empty_items():
+    html = "<table><tr><th>発表日</th></tr><tr><td class='d'>2026年11月4日</td></tr></table>"
+    rows = extract_rows(html, [FieldSpec.parse("date=td.d")], "tr")
+    assert rows == [{"date": "2026年11月4日"}]

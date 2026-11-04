@@ -25,6 +25,7 @@ def target(tmp_path):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
+    server.server_close()
 
 
 @pytest.fixture
@@ -120,3 +121,52 @@ def test_download_unknown_token(ui):
     status, _, body = _request(ui, "POST", "/download", {"token": "nope", "format": "csv"})
     assert status == 404
     assert "期限切れ" in body
+
+
+PICK_PAGE = """<html><head><title>t</title>
+<link rel="preload" href="/x.js" as="script">
+<link rel="stylesheet" href="/s.css">
+<meta http-equiv="refresh" content="0;url=https://evil.example">
+<base href="https://evil.example/">
+</head><body onload="steal()">
+<form action="/submit"><a href="javascript:alert(1)" onclick="x()">bad</a>
+<a href="/ok.html">ok</a></form>
+<script>document.title = 'x'</script>
+<iframe src="https://evil.example"></iframe>
+<ul><li class="item"><h2>記事</h2></li></ul>
+</body></html>"""
+
+
+def test_sanitize_removes_active_content():
+    from easyscrape.picker import PICKER_JS, sanitize
+
+    out = sanitize(PICK_PAGE, "https://example.com/list")
+    assert "steal()" not in out
+    assert "evil.example" not in out
+    assert "javascript:alert" not in out
+    assert "<form" not in out
+    assert "<iframe" not in out
+    assert "preload" not in out
+    assert "stylesheet" in out
+    assert '<base href="https://example.com/list"' in out
+    assert out.count("<script>") == 1  # 選択用スクリプトだけ
+    assert PICKER_JS in out
+    assert 'href="/ok.html"' in out
+
+
+def test_pick_frame_route(ui, target):
+    status, headers, body = _request(ui, "GET", "/pick-frame?url=" + target + "/list.html")
+    assert status == 200
+    assert "default-src 'none'" in headers["Content-Security-Policy"]
+    assert "easyscrape-hover" in body
+    assert "<h2>" in body
+
+
+def test_pick_frame_rejects_bad_url(ui):
+    status, _, body = _request(ui, "GET", "/pick-frame?url=file:///etc/passwd")
+    assert status == 400
+
+
+def test_pick_frame_foreign_host(ui, target):
+    status, _, _ = _request(ui, "GET", "/pick-frame?url=" + target + "/list.html", host="evil.example")
+    assert status == 403

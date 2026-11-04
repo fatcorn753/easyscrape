@@ -101,9 +101,11 @@ def extract_rows(html: str, fields: list[FieldSpec], item_selector: str | None) 
     """ページから行を取り出す。
 
     item_selector が無い場合は、ページ全体で 1 行（各フィールドは最初の一致）。
-    item_selector がある場合は、一致した要素ごとに 1 行。
+    item_selector がある場合は、一致した要素ごとに 1 行（全項目が空の行は除く）。
     """
     soup = BeautifulSoup(html, "html.parser")
     if item_selector is None:
         return [extract_record(soup, fields)]
-    return [extract_record(item, fields) for item in soup.select(item_selector)]
+    # 一覧の見出し行など、どの項目も取れなかった要素は行にしない
+    rows = [extract_record(item, fields) for item in soup.select(item_selector)]
+    return [row for row in rows if any(row.values())]

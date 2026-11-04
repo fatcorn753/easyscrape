@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from easyscrape.extract import FieldSpec
+from easyscrape.fetch import FetchError, Fetcher
+from easyscrape.picker import FRAME_CSP, sanitize
 from easyscrape.job import ScrapeJob, ScrapeResult, run_job
 from easyscrape.output import render, warn_personal_info
 from easyscrape.cli import _parse_form, _parse_headers
@@ -148,6 +150,7 @@ class ResultStore:
 
 
 STORE = ResultStore()
+PICK_FETCHER = Fetcher(delay=MIN_DELAY)
 
 
 # ---- HTML 生成。取得した値はすべて html.escape を通す ----
@@ -172,6 +175,14 @@ th,td{border-bottom:1px solid #e5e5ea;padding:6px 8px;text-align:left;vertical-a
 th{background:#f2f2f7;position:sticky;top:0}
 td{word-break:break-all}
 .presets button{background:#fff;color:#0a66c2;border:1px solid #0a66c2;margin-right:6px}
+.pick-bar{display:flex;gap:8px;margin-top:8px}
+.pick-bar input{flex:1;font:14px system-ui,sans-serif;padding:8px;border:1px solid #c7c7cc;border-radius:6px}
+.pick-bar button{margin:0}
+.pick-mode{margin-top:10px;line-height:2}
+.pick-mode label{display:inline;font-weight:400;margin-right:14px}
+#pick-frame{width:100%;height:520px;border:1px solid #c7c7cc;border-radius:8px;margin-top:10px;background:#fff}
+.status{margin:8px 0 0;color:#1d1d1f;font-size:14px}
+.status.warn{color:#c93400}
 """
 
 PRESET_SCRIPT = """
@@ -181,7 +192,103 @@ function applyPreset(i){
   for (const k of ['urls','item','fields','records','data','headers']) {
     document.getElementById(k).value = p[k];
   }
+  document.getElementById('item').dispatchEvent(new Event('change'));
 }
+"""
+
+PICK_SCRIPT = r"""
+(function () {
+  const frame = document.getElementById('pick-frame');
+  const status = document.getElementById('pick-status');
+  const itemBox = document.getElementById('item');
+  const fieldsBox = document.getElementById('fields');
+
+  function say(text, warn) {
+    status.textContent = text;
+    status.className = warn ? 'warn' : '';
+  }
+  function mode() {
+    return document.querySelector('input[name=pickmode]:checked').value;
+  }
+  function sendInit() {
+    if (!frame.contentWindow) return;
+    frame.contentWindow.postMessage(
+      { source: 'easyscrape-parent', type: 'init', item: itemBox.value.trim() || null }, '*');
+  }
+  function load() {
+    const url = document.getElementById('pick-url').value.trim();
+    if (!/^https?:\/\//.test(url)) {
+      say('http:// か https:// で始まる URL を入力してください', true);
+      return;
+    }
+    say('読み込み中…');
+    frame.src = '/pick-frame?url=' + encodeURIComponent(url);
+  }
+  function addField(name, selector) {
+    const current = fieldsBox.value.replace(/\s+$/, '');
+    fieldsBox.value = (current ? current + '\n' : '') + name + '=' + selector;
+  }
+
+  document.getElementById('pick-load').addEventListener('click', load);
+  itemBox.addEventListener('change', sendInit);
+
+  window.addEventListener('message', function (e) {
+    if (e.source !== frame.contentWindow) return;
+    const d = e.data;
+    if (!d || d.source !== 'easyscrape') return;
+    if (d.type === 'ready') {
+      sendInit();
+      say('クリックして項目を選んでください（緑の枠が取り出される範囲）');
+      return;
+    }
+    if (d.type === 'error') {
+      say(d.message, true);
+      return;
+    }
+    if (d.type !== 'pick') return;
+
+    const m = mode();
+    if (m === 'item') {
+      if (!d.item) {
+        say('繰り返しの要素が見つかりませんでした。一覧の 1 件の中をクリックしてください', true);
+        return;
+      }
+      itemBox.value = d.item.sel;
+      sendInit();
+      say('1 件分の要素: ' + d.item.sel + '（一覧 ' + d.item.count + ' 件）');
+      return;
+    }
+    if (d.outside) {
+      say('「1 件分の要素」の中をクリックしてください', true);
+      return;
+    }
+    let selector = d.field;
+    let suffix = '';
+    if (m === 'href') {
+      if (!d.anchor) {
+        say('リンクが見つかりません。リンクの文字をクリックしてください', true);
+        return;
+      }
+      selector = d.anchor;
+      suffix = '@href';
+    }
+    if (!selector) {
+      say('この要素は指定できませんでした。別の場所をクリックしてください', true);
+      return;
+    }
+    const name = prompt('この項目の名前（英数字。例: title, link, date）', m === 'href' ? 'link' : 'title');
+    if (!name || !name.trim()) {
+      say('追加をキャンセルしました');
+      return;
+    }
+    if (/[=@\s]/.test(name.trim())) {
+      say('項目名に空白・=・@ は使えません', true);
+      return;
+    }
+    addField(name.trim(), selector + suffix);
+    say('追加: ' + name.trim() + '=' + selector + suffix + '（一致 ' + d.count + ' 件 / 例: ' + (d.text || '') + '）');
+  });
+})();
 """
 
 
@@ -214,6 +321,21 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
 <section class="presets">
   <strong>サンプルを入れる</strong><br>
   {preset_buttons}
+</section>
+<section>
+  <strong>ページ上でクリックして選ぶ</strong>
+  <small>URL を入れて「読み込む」→ 取り出したいものをクリック。ページの内容は画面内だけで表示されます。</small>
+  <div class="pick-bar">
+    <input type="text" id="pick-url" placeholder="https://..." value="{_esc(_first_line(values.get("urls", "")))}">
+    <button type="button" id="pick-load" class="sub">読み込む</button>
+  </div>
+  <div class="pick-mode">
+    <label><input type="radio" name="pickmode" value="item" checked> 1 件分の要素（一覧の 1 件を囲む）</label>
+    <label><input type="radio" name="pickmode" value="text"> 文字を取り出す項目</label>
+    <label><input type="radio" name="pickmode" value="href"> リンク先（URL）を取り出す項目</label>
+  </div>
+  <p id="pick-status" class="status">読み込み前</p>
+  <iframe id="pick-frame" sandbox="allow-scripts" title="取得するページ"></iframe>
 </section>
 <form method="post" action="/run">
 <section>
@@ -250,8 +372,14 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
 <button type="submit">取得する</button>
 </form>
 <script>{PRESET_SCRIPT % json.dumps(PRESETS, ensure_ascii=False)}</script>
+<script>{PICK_SCRIPT}</script>
 """
     return _page("かんたんスクレイピング", body)
+
+
+def _first_line(text: str) -> str:
+    lines = _lines(text)
+    return lines[0] if lines else ""
 
 
 def _hidden(values: dict[str, str]) -> str:
@@ -335,10 +463,35 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._send(403, _page("403", "<h1>403</h1>"))
             return
-        if self.path not in ("/", "/index.html"):
-            self._send(404, _page("404", "<h1>404</h1>"))
+        if self.path in ("/", "/index.html"):
+            self._send(200, form_page(dict(PRESETS[0])))
             return
-        self._send(200, form_page(dict(PRESETS[0])))
+        if self.path.startswith("/pick-frame"):
+            self._pick_frame()
+            return
+        self._send(404, _page("404", "<h1>404</h1>"))
+
+    def _pick_frame(self) -> None:
+        query = urllib.parse.urlsplit(self.path).query
+        url = urllib.parse.parse_qs(query).get("url", [""])[-1].strip()
+        if not url.startswith(("http://", "https://")):
+            self._send(400, _page("エラー", "<p>http:// か https:// で始まる URL を指定してください。</p>"))
+            return
+        try:
+            text, content_type = PICK_FETCHER.fetch(url)
+        except FetchError as exc:
+            message = html.escape(str(exc))
+            self._send(200, _page("エラー", f"<p>ページを取得できませんでした: {message}</p>"))
+            return
+        if "html" not in content_type.lower() and content_type:
+            self._send(200, _page("エラー", "<p>HTML のページではないため、クリックでは選べません。</p>"))
+            return
+        self._send(
+            200,
+            sanitize(text, url).encode("utf-8"),
+            "text/html; charset=utf-8",
+            {"Content-Security-Policy": FRAME_CSP, "X-Content-Type-Options": "nosniff"},
+        )
 
     def do_POST(self) -> None:
         if not self._host_ok():
