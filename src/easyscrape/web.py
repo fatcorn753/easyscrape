@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from easyscrape.extract import FieldSpec
 from easyscrape.fetch import FetchError, Fetcher
-from easyscrape.picker import FRAME_CSP, sanitize
+from easyscrape.picker import FRAME_CSP, sanitize, suggest
 from easyscrape.job import ScrapeJob, ScrapeResult, run_job
 from easyscrape.output import render, warn_personal_info
 from easyscrape.cli import _parse_form, _parse_headers
@@ -32,22 +32,40 @@ KEEP_RESULTS = 5  # 直近の結果だけをメモリに残す（CSV 保存時�
 
 PRESETS = [
     {
-        "label": "KADOKAWA 文庫の新刊（JSON）",
-        "urls": "https://www.kadokawa.co.jp/product/search/",
-        "item": "",
-        "fields": "itemCode=itemCode\ntitle=title\nperson=person\nrelease_date=release_date\nproduct_form_id=product_form_id",
-        "records": "result.all",
-        "data": "mgenre=51\nreleaseDate=1\nsize=20\npageno=1\npageno_book=1",
-        "headers": "X-Requested-With: XMLHttpRequest",
+        "label": "総務省 報道資料一覧",
+        "urls": "https://www.soumu.go.jp/menu_news/s-news/index.html",
+        "item": "table.tableList tr:has(td)",
+        "fields": "date=td.nw\ntitle=td a\nlink=td a@href\ndept=td:nth-of-type(3)",
+        "records": "",
+        "data": "",
+        "headers": "",
     },
     {
-        "label": "KADOKAWA 文庫の新刊一覧（HTML の例）",
+        "label": "環境省 報道発表一覧",
+        "urls": "https://www.env.go.jp/press/index.html",
+        "item": "li.c-news-link__item",
+        "fields": "dept=span.c-tag\ntitle=a.c-news-link__link\nlink=a.c-news-link__link@href",
+        "records": "",
+        "data": "",
+        "headers": "",
+    },
+    {
+        "label": "KADOKAWA 文庫の一覧（HTML の例）",
         "urls": "https://www.kadokawa.co.jp/category/bunko/",
         "item": ".book-thumb",
         "fields": "title=.book-detail-title.pc-only\nauthor=.book-detail-text\nlink=a@href",
         "records": "",
         "data": "",
         "headers": "",
+    },
+    {
+        "label": "KADOKAWA 文庫の新刊（API・上級）",
+        "urls": "https://www.kadokawa.co.jp/product/search/",
+        "item": "",
+        "fields": "itemCode=itemCode\ntitle=title\nperson=person\nrelease_date=release_date\nproduct_form_id=product_form_id",
+        "records": "result.all",
+        "data": "mgenre=51\nreleaseDate=1\nsize=20\npageno=1\npageno_book=1",
+        "headers": "X-Requested-With: XMLHttpRequest",
     },
 ]
 
@@ -180,6 +198,13 @@ td{word-break:break-all}
 .pick-bar button{margin:0}
 .pick-mode{margin-top:10px;line-height:2}
 .pick-mode label{display:inline;font-weight:400;margin-right:14px}
+h2.step{font-size:17px;margin:0 0 6px}
+details.advanced{background:#fff;border-radius:10px;padding:12px 16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+details.advanced summary{cursor:pointer;font-weight:600}
+.suggest{margin-top:10px}
+.suggest table{margin-top:8px}
+.suggest input[type=text]{font:14px system-ui,sans-serif}
+.suggest input[type=checkbox]{width:auto}
 #pick-frame{width:100%;height:520px;border:1px solid #c7c7cc;border-radius:8px;margin-top:10px;background:#fff}
 .status{margin:8px 0 0;color:#1d1d1f;font-size:14px}
 .status.warn{color:#c93400}
@@ -202,10 +227,13 @@ PICK_SCRIPT = r"""
   const status = document.getElementById('pick-status');
   const itemBox = document.getElementById('item');
   const fieldsBox = document.getElementById('fields');
+  const urlsBox = document.getElementById('urls');
+  const suggestBox = document.getElementById('suggest');
+  const NAME_OK = /^[^=@\s]+$/;
 
   function say(text, warn) {
     status.textContent = text;
-    status.className = warn ? 'warn' : '';
+    status.className = warn ? 'status warn' : 'status';
   }
   function mode() {
     return document.querySelector('input[name=pickmode]:checked').value;
@@ -215,22 +243,140 @@ PICK_SCRIPT = r"""
     frame.contentWindow.postMessage(
       { source: 'easyscrape-parent', type: 'init', item: itemBox.value.trim() || null }, '*');
   }
+  function el(tag, text, cls) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    if (cls) node.className = cls;
+    return node;
+  }
+
+  // ---- 1. ページを開く ----
   function load() {
     const url = document.getElementById('pick-url').value.trim();
     if (!/^https?:\/\//.test(url)) {
       say('http:// か https:// で始まる URL を入力してください', true);
       return;
     }
+    urlsBox.value = url;
     say('読み込み中…');
+    suggestBox.textContent = '';
     frame.src = '/pick-frame?url=' + encodeURIComponent(url);
   }
+  document.getElementById('pick-load').addEventListener('click', load);
+  itemBox.addEventListener('change', sendInit);
+
+  // ---- 2. 自動提案 ----
+  function suggest() {
+    const url = document.getElementById('pick-url').value.trim();
+    if (!/^https?:\/\//.test(url)) {
+      say('先に URL を入力して「読み込む」を押してください', true);
+      return;
+    }
+    suggestBox.textContent = '候補を探しています…';
+    fetch('/suggest?url=' + encodeURIComponent(url), { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(renderSuggest)
+      .catch(function () { suggestBox.textContent = '候補を取得できませんでした。'; });
+  }
+  function renderSuggest(data) {
+    suggestBox.textContent = '';
+    if (data.error) {
+      suggestBox.appendChild(el('p', data.error, 'status warn'));
+      return;
+    }
+    const candidates = data.candidates || [];
+    if (!candidates.length) {
+      suggestBox.appendChild(el('p', '一覧を自動で見つけられませんでした。' +
+        'ページを開いて「一覧の 1 件」をクリックするか、サンプルを試してください。' +
+        '（JavaScript で後から表示されるページは取れない場合があります）', 'status warn'));
+      return;
+    }
+    const pick = el('select');
+    candidates.forEach(function (c, i) {
+      const sample = c.fields.length ? c.fields[0].preview : '';
+      const opt = el('option', '候補 ' + (i + 1) + '：' + c.count + ' 件' + (sample ? '（例: ' + sample.slice(0, 30) + '）' : ''));
+      opt.value = String(i);
+      pick.appendChild(opt);
+    });
+    const area = el('div');
+    suggestBox.appendChild(el('p', '一覧の候補を選んでください（件数が正しいものを選びます）'));
+    suggestBox.appendChild(pick);
+    suggestBox.appendChild(area);
+    pick.addEventListener('change', function () { renderCandidate(candidates[Number(pick.value)], area); });
+    renderCandidate(candidates[0], area);
+  }
+  function renderCandidate(c, area) {
+    area.textContent = '';
+    const useItem = el('button', 'この一覧を使う');
+    useItem.type = 'button';
+    useItem.className = 'sub';
+    useItem.addEventListener('click', function () {
+      itemBox.value = c.item;
+      sendInit();
+      say('一覧の 1 件を設定しました');
+    });
+    area.appendChild(useItem);
+
+    const table = el('table');
+    const head = el('tr');
+    ['使う', '項目名', '例（1 件目）', '取れた件数'].forEach(function (t) { head.appendChild(el('th', t)); });
+    table.appendChild(el('thead')).appendChild(head);
+    const body = el('tbody');
+    const rows = [];
+    c.fields.forEach(function (f) {
+      const tr = el('tr');
+      const check = el('input');
+      check.type = 'checkbox';
+      check.checked = true;
+      const name = el('input');
+      name.type = 'text';
+      name.value = f.name;
+      const td1 = el('td'); td1.appendChild(check);
+      const td2 = el('td'); td2.appendChild(name);
+      tr.appendChild(td1);
+      tr.appendChild(td2);
+      tr.appendChild(el('td', f.preview));
+      tr.appendChild(el('td', f.coverage + ' / ' + c.count));
+      body.appendChild(tr);
+      rows.push({ check: check, name: name, field: f });
+    });
+    table.appendChild(body);
+    const wrap = el('div', undefined, 'table-wrap');
+    wrap.appendChild(table);
+    area.appendChild(wrap);
+
+    const apply = el('button', '選んだ項目を「3」に入れる（置き換え）');
+    apply.type = 'button';
+    apply.addEventListener('click', function () {
+      const lines = [];
+      for (const row of rows) {
+        if (!row.check.checked) continue;
+        const name = row.name.value.trim();
+        if (!NAME_OK.test(name)) {
+          say('項目名に空白・=・@ は使えません: ' + name, true);
+          return;
+        }
+        const attr = row.field.attr ? '@' + row.field.attr : '';
+        lines.push(name + '=' + row.field.selector + attr);
+      }
+      if (!lines.length) {
+        say('項目を 1 つ以上選んでください', true);
+        return;
+      }
+      itemBox.value = c.item;
+      fieldsBox.value = lines.join('\n');
+      sendInit();
+      say('「3. 取り出す内容」に ' + lines.length + ' 件入れました。内容を確認して「取得する」を押してください');
+    });
+    area.appendChild(apply);
+  }
+  document.getElementById('suggest-run').addEventListener('click', suggest);
+
+  // ---- 3. クリックで選んだ内容を受け取る ----
   function addField(name, selector) {
     const current = fieldsBox.value.replace(/\s+$/, '');
     fieldsBox.value = (current ? current + '\n' : '') + name + '=' + selector;
   }
-
-  document.getElementById('pick-load').addEventListener('click', load);
-  itemBox.addEventListener('change', sendInit);
 
   window.addEventListener('message', function (e) {
     if (e.source !== frame.contentWindow) return;
@@ -238,7 +384,8 @@ PICK_SCRIPT = r"""
     if (!d || d.source !== 'easyscrape') return;
     if (d.type === 'ready') {
       sendInit();
-      say('クリックして項目を選んでください（緑の枠が取り出される範囲）');
+      say('クリックして取り出したいものを選んでください（緑の枠が取り出される範囲）');
+      suggest();
       return;
     }
     if (d.type === 'error') {
@@ -255,11 +402,11 @@ PICK_SCRIPT = r"""
       }
       itemBox.value = d.item.sel;
       sendInit();
-      say('1 件分の要素: ' + d.item.sel + '（一覧 ' + d.item.count + ' 件）');
+      say('一覧の 1 件: ' + d.item.sel + '（一覧 ' + d.item.count + ' 件）');
       return;
     }
     if (d.outside) {
-      say('「1 件分の要素」の中をクリックしてください', true);
+      say('「一覧の 1 件」の中をクリックしてください', true);
       return;
     }
     let selector = d.field;
@@ -281,7 +428,7 @@ PICK_SCRIPT = r"""
       say('追加をキャンセルしました');
       return;
     }
-    if (/[=@\s]/.test(name.trim())) {
+    if (!NAME_OK.test(name.trim())) {
       say('項目名に空白・=・@ は使えません', true);
       return;
     }
@@ -319,55 +466,65 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
 <h1>かんたんスクレイピング</h1>
 {error_html}
 <section class="presets">
-  <strong>サンプルを入れる</strong><br>
+  <strong>サンプルで試す</strong><br>
   {preset_buttons}
 </section>
+
 <section>
-  <strong>ページ上でクリックして選ぶ</strong>
-  <small>URL を入れて「読み込む」→ 取り出したいものをクリック。ページの内容は画面内だけで表示されます。</small>
+  <h2 class="step">1. ページを開く</h2>
+  <small>取りたい情報が載っているページの URL を入れて「読み込む」。</small>
   <div class="pick-bar">
     <input type="text" id="pick-url" placeholder="https://..." value="{_esc(_first_line(values.get("urls", "")))}">
-    <button type="button" id="pick-load" class="sub">読み込む</button>
-  </div>
-  <div class="pick-mode">
-    <label><input type="radio" name="pickmode" value="item" checked> 1 件分の要素（一覧の 1 件を囲む）</label>
-    <label><input type="radio" name="pickmode" value="text"> 文字を取り出す項目</label>
-    <label><input type="radio" name="pickmode" value="href"> リンク先（URL）を取り出す項目</label>
+    <button type="button" id="pick-load">読み込む</button>
   </div>
   <p id="pick-status" class="status">読み込み前</p>
   <iframe id="pick-frame" sandbox="allow-scripts" title="取得するページ"></iframe>
+  <small>ページ上の目印をクリックすると、下の「3. 取り出す内容」に自動で入ります。</small>
+  <div class="pick-mode">
+    <label><input type="radio" name="pickmode" value="item" checked> 一覧の 1 件（同じ形で並ぶもの全体）を選ぶ</label>
+    <label><input type="radio" name="pickmode" value="text"> 文字を取り出す</label>
+    <label><input type="radio" name="pickmode" value="href"> リンク先（URL）を取り出す</label>
+  </div>
 </section>
+
+<section>
+  <h2 class="step">2. 自動で候補を出す</h2>
+  <button type="button" id="suggest-run" class="sub">候補を自動で探す</button>
+  <div id="suggest" class="suggest"></div>
+</section>
+
 <form method="post" action="/run">
 <section>
+  <h2 class="step">3. 取り出す内容</h2>
   <label for="urls">取得するページの URL（1 行に 1 つ）</label>
   <textarea id="urls" name="urls">{_esc(values.get("urls", ""))}</textarea>
 
-  <label for="item">1 件分の要素（任意）</label>
+  <label for="item">一覧の 1 件（任意）</label>
   <input type="text" id="item" name="item" value="{_esc(values.get("item", ""))}">
-  <small>一覧ページで 1 冊分・1 記事分を囲む要素を指定します（例: <code>li.article</code>）。
-  空欄なら、ページ全体で 1 行になります。JSON の場合は使いません。</small>
+  <small>同じ形で並ぶ 1 件分の目印。一覧でない単独のページなら空欄のまま。</small>
 
   <label for="fields">取り出す項目（1 行に 1 つ）</label>
   <textarea id="fields" name="fields">{_esc(values.get("fields", ""))}</textarea>
-  <small>書き方: <code>項目名=場所</code>。場所は HTML なら CSS セレクタ（例: <code>h2</code>）、
-  末尾に <code>@href</code> などを付けると属性値を取ります。JSON ならキー名（例: <code>title</code>）。</small>
-
-  <label for="records">JSON の場合: 行が入っている場所（任意）</label>
-  <input type="text" id="records" name="records" value="{_esc(values.get("records", ""))}">
-  <small>例: <code>result.all</code>。HTML のページでは空欄のままにします。</small>
+  <small>書き方: <code>項目名=場所</code>。例: <code>title=h2</code>、リンクは <code>link=a@href</code>。</small>
 </section>
-<section>
-  <label for="data">POST で送る値（任意・1 行に 1 つ）</label>
-  <textarea id="data" name="data">{_esc(values.get("data", ""))}</textarea>
-  <small>検索結果を取る API 向けです。書き方: <code>キー=値</code>。普通のページでは空欄のままにします。</small>
 
-  <label for="headers">追加の HTTP ヘッダー（任意・1 行に 1 つ）</label>
+<details class="advanced">
+  <summary>詳細設定（API・JSON・待ち時間）</summary>
+  <label for="records">JSON の場合: 行が入っている場所</label>
+  <input type="text" id="records" name="records" value="{_esc(values.get("records", ""))}">
+  <small>例: <code>result.all</code>。普通のページでは空欄。</small>
+
+  <label for="data">POST で送る値（1 行に 1 つ）</label>
+  <textarea id="data" name="data">{_esc(values.get("data", ""))}</textarea>
+  <small>書き方: <code>キー=値</code>。検索 API 向け。普通のページでは空欄。</small>
+
+  <label for="headers">追加の HTTP ヘッダー（1 行に 1 つ）</label>
   <textarea id="headers" name="headers">{_esc(values.get("headers", ""))}</textarea>
-  <small>書き方: <code>名前: 値</code>。通常は空欄のままで大丈夫です。</small>
+  <small>書き方: <code>名前: 値</code>。通常は空欄。</small>
 
   <label for="delay">同じサイトへの待ち時間（秒）</label>
   <input type="number" id="delay" name="delay" min="1" step="0.5" value="{_esc(values.get("delay", "1"))}">
-  <small>1 秒未満にはできません。サイトによっては robots.txt の指定でさらに長くなります。</small>
+  <small>1 秒未満にはできません。サイトの robots.txt でさらに長くなる場合があります。</small>
 </section>
 <button type="submit">取得する</button>
 </form>
@@ -475,7 +632,29 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/pick-frame"):
             self._pick_frame()
             return
+        if self.path.startswith("/suggest"):
+            self._suggest()
+            return
         self._send(404, _page("404", "<h1>404</h1>"))
+
+    def _suggest(self) -> None:
+        url = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("url", [""])[-1].strip()
+        if not url.startswith(("http://", "https://")):
+            self._json(400, {"error": "http:// か https:// で始まる URL を入力してください。"})
+            return
+        try:
+            text, content_type = PICK_FETCHER.fetch(url)
+        except FetchError as exc:
+            self._json(200, {"error": f"ページを取得できませんでした: {exc}"})
+            return
+        if content_type and "html" not in content_type.lower():
+            self._json(200, {"error": "HTML のページではないため、候補は出せません。"})
+            return
+        self._json(200, suggest(text))
+
+    def _json(self, status: int, data: dict) -> None:
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self._send(status, payload, "application/json; charset=utf-8", {"X-Content-Type-Options": "nosniff"})
 
     def _pick_frame(self) -> None:
         query = urllib.parse.urlsplit(self.path).query

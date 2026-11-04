@@ -19,6 +19,7 @@ TARGET_HTML = """<html><body>
 @pytest.fixture
 def target(tmp_path):
     (tmp_path / "list.html").write_text(TARGET_HTML, encoding="utf-8")
+    (tmp_path / "suggest.html").write_text(SUGGEST_PAGE_HTML, encoding="utf-8")
     handler = partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
     handler.log_message = lambda *a, **k: None
     server = HTTPServer(("127.0.0.1", 0), handler)
@@ -199,3 +200,47 @@ def test_cross_site_fetch_metadata_rejected(ui):
     conn.request("GET", "/", headers={"Host": f"127.0.0.1:{ui.server_port}", "Sec-Fetch-Site": "cross-site"})
     assert conn.getresponse().status == 403
     conn.close()
+
+
+SUGGEST_PAGE_HTML = "<html><body><nav><ul><li><a href='/x'>短</a></li><li><a href='/y'>短い</a></li><li><a href='/z'>短い</a></li></ul></nav>" + "".join(
+    f"<div class='news'><h2>記事のタイトル番号{i}です</h2><a href='/p/{i}'>読む</a><span class='tag'>区分{i}</span></div>"
+    for i in range(5)
+) + "</body></html>"
+
+
+def test_suggest_finds_item_and_fields():
+    from easyscrape.picker import suggest
+
+    result = suggest(SUGGEST_PAGE_HTML)
+    assert result["candidates"][0]["item"] == "div.news"
+    assert result["candidates"][0]["count"] == 5
+    names = {f["name"]: f for f in result["candidates"][0]["fields"]}
+    assert names["title"]["selector"] == "h2"
+    assert names["link"]["selector"] == "a" and names["link"]["attr"] == "href"
+    assert names["link"]["coverage"] == 5
+
+
+def test_suggest_no_repeat_returns_none():
+    from easyscrape.picker import suggest
+
+    result = suggest("<html><body><p>ひとつだけ</p></body></html>")
+    assert result == {"candidates": []}
+
+
+def test_suggest_route_json(ui, target):
+    status, headers, body = _request(ui, "GET", "/suggest?url=" + target + "/suggest.html")
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    import json as _json
+
+    data = _json.loads(body)
+    assert data["candidates"][0]["item"] == "div.news"
+    assert data["candidates"][0]["count"] == 5
+
+
+def test_form_has_guided_sections_and_public_presets(ui):
+    status, _, body = _request(ui, "GET", "/")
+    assert "1. ページを開く" in body
+    assert "候補を自動で探す" in body
+    assert "総務省 報道資料一覧" in body
+    assert "<details class=\"advanced\">" in body

@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
-from bs4 import BeautifulSoup
+import re
+
+from bs4 import BeautifulSoup, Tag
 
 # 実行・埋め込み・画面遷移につながる要素
 REMOVE_TAGS = ["script", "noscript", "iframe", "frame", "frameset", "object", "embed", "applet", "base"]
@@ -269,3 +271,176 @@ FRAME_CSP = (
     "default-src 'none'; script-src 'unsafe-inline'; style-src * 'unsafe-inline'; "
     "img-src * data: blob:; font-src *; media-src *"
 )
+
+
+# ---- 自動提案: ページから一覧（繰り返し要素）と取り出せる項目を推定する ----
+
+SUGGEST_MAX_FIELDS = 8
+MIN_TEXT_LEN = 3
+_TEXT_TAGS = {"span", "p", "td", "th", "strong", "em", "time", "dd", "dt", "li", "div", "small", "label", "b"}
+_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_CLASS_OK = re.compile(r"^[A-Za-z_][\w-]*$")
+
+
+_CHROME_TAGS = {"nav", "header", "footer", "aside"}
+_CHROME_CLASS = re.compile(r"nav|menu|footer|header|sidebar|breadcrumb|gnav|lnav|share", re.IGNORECASE)
+
+
+def _in_chrome(el: Tag) -> bool:
+    """ナビゲーション・ヘッダー・フッター等の中か（一覧の本体ではないことが多い）。"""
+    for node in [el, *el.parents]:
+        if not isinstance(node, Tag):
+            continue
+        if node.name in _CHROME_TAGS:
+            return True
+        ident = " ".join(node.get("class") or []) + " " + (node.get("id") or "")
+        if _CHROME_CLASS.search(ident):
+            return True
+    return False
+
+
+def _sig(el: Tag) -> str:
+    classes = [c for c in (el.get("class") or []) if _CLASS_OK.match(c) and not c.startswith("easyscrape-")][:2]
+    return el.name + "".join("." + c for c in classes)
+
+
+def _value(node: Tag | None, attr: str | None) -> str:
+    if node is None:
+        return ""
+    if attr is None:
+        return node.get_text(" ", strip=True)
+    value = node.get(attr, "")
+    if isinstance(value, list):
+        value = " ".join(value)
+    return str(value).strip()
+
+
+def _position_path(root: Tag, el: Tag) -> str:
+    """root から el までを tag:nth-of-type で表す（位置ベースの最後の手段）。"""
+    parts = []
+    node = el
+    while node is not None and node is not root and isinstance(node, Tag):
+        parent = node.parent
+        seg = node.name
+        if isinstance(parent, Tag):
+            same = [c for c in parent.find_all(node.name, recursive=False)]
+            if len(same) > 1:
+                seg += f":nth-of-type({same.index(node) + 1})"
+        parts.insert(0, seg)
+        node = parent if isinstance(parent, Tag) else None
+    return " > ".join(parts)
+
+
+def _coverage(members: list[Tag], selector: str, attr: str | None) -> tuple[int, str]:
+    hits = 0
+    preview = ""
+    for member in members:
+        try:
+            node = member.select_one(selector)
+        except Exception:
+            return 0, ""
+        value = _value(node, attr)
+        if value:
+            hits += 1
+            if not preview:
+                preview = value[:40]
+    return hits, preview
+
+
+def _field_candidates(first: Tag) -> list[tuple[str, str | None, Tag]]:
+    """先頭の 1 件から、取り出せそうな要素を (種類, 属性, 要素) で列挙する。"""
+    found = []
+    for el in first.find_all(True)[:300]:
+        if el.name in _HEADING_TAGS and el.get_text(strip=True):
+            found.append(("title", None, el))
+        elif el.name == "a" and el.get("href") and el.get_text(strip=True):
+            found.append(("link", "href", el))
+            found.append(("title", None, el))
+        elif el.name == "img" and el.get("src"):
+            found.append(("image", "src", el))
+        elif el.name in _TEXT_TAGS and el.get_text(strip=True):
+            # 文字を直接持つ葉の要素だけ（入れ子の要素が文字を持つなら重複するので除く）
+            if not any(c.get_text(strip=True) for c in el.find_all(True, recursive=False)):
+                found.append(("text", None, el))
+    return found
+
+
+SUGGEST_MAX_CANDIDATES = 3
+
+
+def _fields_for(members: list[Tag]) -> list[dict]:
+    """一覧の見本 1 件から、全件で取れる項目を候補として返す。"""
+    # 見出し行のように中身が少ない件は避け、文字が最も多い件を見本にする
+    first = max(members, key=lambda m: len(m.get_text(strip=True)))
+    fields: list[dict] = []
+    used: set[tuple[str, str | None]] = set()
+    shown: set[tuple[int, str]] = set()
+    counters: dict[str, int] = {}
+    for kind, attr, el in _field_candidates(first):
+        selector = None
+        for cand in (_sig(el), el.name, _position_path(first, el)):
+            if not cand or (cand, attr) in used:
+                continue
+            hits, _ = _coverage(members, cand, attr)
+            if hits >= max(1, int(len(members) * 0.8)):
+                selector = cand
+                break
+        if selector is None:
+            continue
+        used.add((selector, attr))
+        hits, preview = _coverage(members, selector, attr)
+        # 同じ値を取る別の候補（親子で同じ文字を指すもの）は 1 つにまとめる
+        if (hits, preview) in shown:
+            continue
+        shown.add((hits, preview))
+        counters[kind] = counters.get(kind, 0) + 1
+        name = kind if counters[kind] == 1 and kind != "text" else f"{kind}{counters[kind]}"
+        fields.append({
+            "name": name,
+            "selector": selector,
+            "attr": attr,
+            "preview": preview,
+            "coverage": hits,
+        })
+        if len(fields) >= SUGGEST_MAX_FIELDS:
+            break
+    return fields
+
+
+def suggest(html: str) -> dict:
+    """一覧の候補（繰り返し要素）と、各候補で取り出せる項目を返す。
+
+    一覧の候補: 同じ親の下に 3 件以上並ぶ要素のうち、件名らしい文字がある件数が多いもの。
+    ナビゲーション・ヘッダー・フッターの中は対象外。上位 SUGGEST_MAX_CANDIDATES 件を返す。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.body or soup
+
+    scored: list[tuple[int, str, list[Tag]]] = []
+    seen: set[str] = set()
+    for parent in [root, *root.find_all(True)]:
+        if _in_chrome(parent):
+            continue
+        groups: dict[str, list[Tag]] = {}
+        for child in parent.find_all(recursive=False):
+            groups.setdefault(_sig(child), []).append(child)
+        for sig, members in groups.items():
+            if len(members) < 3 or sig in seen:
+                continue
+            seen.add(sig)
+            # 件数はナビゲーション等の外側にある件だけで数える
+            total = [m for m in soup.select(sig) if not _in_chrome(m)]
+            doc_filled = sum(1 for m in total if len(m.get_text(strip=True)) >= MIN_TEXT_LEN)
+            if doc_filled >= 3:
+                scored.append((doc_filled, sig, total))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    candidates = []
+    for _, sig, members in scored[:SUGGEST_MAX_CANDIDATES * 3]:
+        fields = _fields_for(members)
+        if not fields:
+            continue  # 取り出せる項目が無い候補は出さない
+        candidates.append({"item": sig, "count": len(members), "fields": fields})
+        if len(candidates) >= SUGGEST_MAX_CANDIDATES:
+            break
+    return {"candidates": candidates}
