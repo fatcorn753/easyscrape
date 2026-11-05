@@ -320,6 +320,11 @@ def test_detail_bad_input_shows_error_and_keeps_confirm(ui, detail_site):
     assert "詳細ページも取得しますか" in body  # 確認を出し直す
 
 
+def test_preset_fills_step1_url():
+    # サンプルを押したとき、手順 1 の URL 欄も埋まること（読み込むが反応するため）
+    assert "getElementById('pick-url').value = p.urls" in web.PRESET_SCRIPT
+
+
 def test_result_page_shows_check_list(ui, target):
     _, _, body = _request(ui, "POST", "/run", {
         "urls": f"{target}/list.html", "item": "li.item", "fields": "title=h2", "delay": "1",

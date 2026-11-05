@@ -219,6 +219,10 @@ function applyPreset(i){
   for (const k of ['urls','item','fields','records','data','headers']) {
     document.getElementById(k).value = p[k];
   }
+  // 手順 1 の URL 欄にも入れる。入れないと「読み込む」が空の URL を見て反応しなくなる
+  document.getElementById('pick-url').value = p.urls;
+  document.getElementById('pick-status').textContent = 'サンプルを入れました。「読み込む」を押してください';
+  document.getElementById('pick-status').className = 'status';
   document.getElementById('item').dispatchEvent(new Event('change'));
 }
 """
