@@ -414,3 +414,134 @@ def test_suggest_embedded_json_ld_root_list_and_skips_useless():
     assert suggest(f"<html><body>{useless}</body></html>")["embedded"] == []
     broken = '<script id="bad">not json</script>'
     assert suggest(f"<html><body>{broken}</body></html>")["embedded"] == []
+
+
+def test_parse_input_expands_url_patterns():
+    parsed = web.parse_input({"urls": "https://x.test/p{1..3}\nhttps://y.test/", "fields": "t=h1"})
+    assert parsed.errors == []
+    assert parsed.urls == ["https://x.test/p1", "https://x.test/p2", "https://x.test/p3", "https://y.test/"]
+    too_many = web.parse_input({"urls": "https://x.test/p{1..999}", "fields": "t=h1"})
+    assert any("上限" in e for e in too_many.errors)
+
+
+def test_expand_route(ui):
+    import json as _json
+
+    _, headers, body = _request(ui, "GET", "/expand?urls=" + urllib.parse.quote("https://x.test/p{1..30}") + "&delay=2")
+    data = _json.loads(body)
+    assert data["count"] == 30
+    assert data["sample"][0] == "https://x.test/p1" and data["sample"][-1] == "https://x.test/p30"
+    assert len(data["sample"]) == 6
+    assert data["minutes"] == 1
+    for bad, text in [("", "入力"), ("ftp://x/{1..2}", "http"), ("https://x/{1..999}", "上限")]:
+        _, _, body = _request(ui, "GET", "/expand?urls=" + urllib.parse.quote(bad))
+        assert text in _json.loads(body)["error"]
+
+
+def test_form_has_expand_and_watch_sections(ui):
+    _, _, body = _request(ui, "GET", "/")
+    assert "URL の展開を確認" in body
+    assert "繰り返し取得を始める" in body
+    assert 'formaction="/watch/start"' in body
+    assert "{1..10}" in body
+
+
+def test_watch_path_rejects_folders_and_hidden():
+    for bad in ["../x.csv", "a/b.csv", ".hidden.csv", "a\\b.csv"]:
+        with pytest.raises(ValueError):
+            web.watch_path(bad)
+    assert web.watch_path("memo").name == "memo.csv"
+    assert web.watch_path("日本語.json").name == "日本語.json"
+    assert web.watch_path("").name == "easyscrape-watch.csv"
+
+
+@pytest.fixture
+def fast_watch(tmp_path, monkeypatch):
+    from easyscrape.watch import WatchPlan
+
+    monkeypatch.setattr(web, "WATCH_DIR", tmp_path / "out")
+    monkeypatch.setattr(web, "make_plan", lambda e, s, t: WatchPlan(every=0.05, cycles=2))
+    return tmp_path / "out"
+
+
+def _watch_values(target, **extra):
+    values = {
+        "urls": f"{target}/list.html", "item": "li.item", "fields": "title=h2", "delay": "1",
+        "watch_every": "1h", "watch_span": "6h", "watch_file": "w.csv",
+    }
+    values.update(extra)
+    return values
+
+
+def _wait_done(ui, watch_id, timeout=10):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, _, body = _request(ui, "GET", f"/watch?id={watch_id}")
+        if "繰り返し取得: 完了" in body or "エラーで止まりました" in body:
+            return body
+        time.sleep(0.1)
+    raise AssertionError("繰り返し取得が終わりませんでした")
+
+
+def test_watch_start_runs_and_appends(ui, target, fast_watch):
+    status, _, body = _request(ui, "POST", "/watch/start", _watch_values(target))
+    assert status == 200 and "繰り返し取得" in body
+    watch_id = re.search(r'name="id" value="([^"]+)"', body).group(1)
+    done = _wait_done(ui, watch_id)
+    assert "2 / 2 回" in done
+    lines = (fast_watch / "w.csv").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "fetched_at,url,title"
+    assert len(lines) == 1 + 2 * 2  # 2 回 × 2 行
+
+
+def test_watch_only_changes_saves_once(ui, target, fast_watch):
+    values = _watch_values(target, watch_only_changes="1", watch_key="title", watch_file="chg.csv")
+    _, _, body = _request(ui, "POST", "/watch/start", values)
+    watch_id = re.search(r'name="id" value="([^"]+)"', body).group(1)
+    _wait_done(ui, watch_id)
+    lines = (fast_watch / "chg.csv").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "fetched_at,url,title,change"
+    assert len(lines) == 3  # 2 回目は変化なしなので増えない
+
+
+def test_watch_stop(ui, target, fast_watch, monkeypatch):
+    from easyscrape.watch import WatchPlan
+
+    monkeypatch.setattr(web, "make_plan", lambda e, s, t: WatchPlan(every=60, cycles=5))
+    _, _, body = _request(ui, "POST", "/watch/start", _watch_values(target, watch_file="stop.csv"))
+    watch_id = re.search(r'name="id" value="([^"]+)"', body).group(1)
+    import time
+
+    time.sleep(0.5)
+    status, _, body = _request(ui, "POST", "/watch/stop", {"id": watch_id})
+    assert status == 200 and "停止を依頼しました" in body
+    for _ in range(50):
+        _, _, body = _request(ui, "GET", f"/watch?id={watch_id}")
+        if "停止しました" in body:
+            break
+        time.sleep(0.1)
+    assert "繰り返し取得: 停止しました" in body
+
+
+@pytest.mark.parametrize("extra, message", [
+    ({"watch_file": "../evil.csv"}, "フォルダは指定できません"),
+    ({"watch_only_changes": "1"}, "見分ける項目名が必要"),
+    ({"watch_key": "nope"}, "取り出す項目にありません"),
+])
+def test_watch_start_validation(ui, target, fast_watch, extra, message):
+    status, _, body = _request(ui, "POST", "/watch/start", _watch_values(target, **extra))
+    assert status == 200
+    assert message in body
+    assert not (fast_watch.parent / "evil.csv").exists()
+
+
+def test_watch_limit_and_unknown_id(ui, target, fast_watch, monkeypatch):
+    monkeypatch.setattr(web, "MAX_RUNNING_WATCHES", 0)
+    _, _, body = _request(ui, "POST", "/watch/start", _watch_values(target))
+    assert "同時に動かせる" in body
+    status, _, _ = _request(ui, "GET", "/watch?id=nope")
+    assert status == 404
+    status, _, _ = _request(ui, "POST", "/watch/stop", {"id": "nope"})
+    assert status == 404

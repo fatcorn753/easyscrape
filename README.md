@@ -14,7 +14,9 @@ uv run easyscrape-ui 8791     # ポートを変える場合
 2. 「2. 自動で候補を出す」で一覧と取り出せる項目の候補が出る。候補を選んで「3. 取り出す内容」に入れる（ページ上のクリックでも入れられる）
 3. 「取得する」を押す。結果が表で表示される
 4. 「CSV で保存」または「JSON で保存」を押す
-5. 一覧のリンクから詳細ページも取る場合は、「詳細ページのリンクの項目名」に入力して取得する。結果画面で件数と時間の目安を確認してから「詳細ページを取得する」を押す（同じサイト・同じフォルダ内だけを対象にする）
+5. 複数のページを順に取る場合は、URL に規則を書く（例: `https://example.com/list?page={1..10}`）。「URL の展開を確認」で、取得するページの一覧と時間の目安を確認できる
+6. 一定期間、定期的に取得したい場合は、画面下の「繰り返し取得」で間隔と期間を選び、「繰り返し取得を始める」を押す。結果は `~/easyscrape-output/` のファイルに追記される。状況の確認と停止は、表示される状況画面から行う
+7. 一覧のリンクから詳細ページも取る場合は、「詳細ページのリンクの項目名」に入力して取得する。結果画面で件数と時間の目安を確認してから「詳細ページを取得する」を押す（同じサイト・同じフォルダ内だけを対象にする）
 
 画面は自分のパソコンの中（127.0.0.1）だけで動き、外部からは見えない。
 クリック選択で表示するページは、スクリプトを外し、サンドボックス付きの枠の中で表示する。
@@ -39,6 +41,21 @@ uv run easyscrape https://www.kadokawa.co.jp/product/search/ \
 uv run easyscrape -i
 ```
 
+```sh
+# URL の規則: {1..10} 連番、{01..12} ゼロ埋め、{1..20..5} 刻み、{tokyo,osaka} 列挙（上限 200 件）
+uv run easyscrape 'https://example.com/list?page={1..10}' --item 'li.article' --field 'title=h2' -o all.csv
+
+# 30 分おきに 24 時間、結果を追記（間隔は 10 分以上、期間は最長 7 日。止めるには Ctrl-C）
+uv run easyscrape https://example.com/news --item 'li.article' --field 'title=h2' --field 'link=a@href' \
+  --every 30m --for 24h -o watch.csv
+
+# 新しい行・内容が変わった行だけを保存（--key で同じ行を見分ける。url 列と組み合わせて判定）
+uv run easyscrape https://example.com/news --item 'li.article' --field 'title=h2' --field 'link=a@href' \
+  --every 1h --for 3d --key link --only-changes -o changes.csv
+```
+
+- 繰り返し取得は、各行に `fetched_at` 列が付き、`-o` のファイルに追記される（既にあるファイルでも `--force` は不要。列が違うと追記しない）。`--only-changes` では `change` 列（`new` / `changed`）も付き、保存済みのファイルを読んで再開後も同じ行を重ねて保存しない
+- 繰り返しは、このプロセスが動いている間だけ続く。PC を閉じたり終了したりすると止まる。長期間は、OS の定期実行から 1 回ずつ呼ぶ方法が向く（例: cron で毎時 `easyscrape … --every 10m --times 1 --key link --only-changes -o changes.csv`。`--times 1` は 1 回だけ取得して終わる）
 - 出力先の拡張子が `.json` なら JSON、それ以外は CSV。`--format` で明示も可
 - 出力先が既にあれば上書きしない。上書きするときは `--force`
 - 複数 URL を渡すと、各行に `url` 列が付く

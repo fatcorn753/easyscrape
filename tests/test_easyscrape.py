@@ -348,3 +348,65 @@ def test_job_with_embedded_source(tmp_path):
         server.server_close()
     assert result.errors == []
     assert [r["name"] for r in result.rows] == ["商品A", "商品B"]
+
+
+def test_cli_expands_url_pattern(site, tmp_path):
+    for n in (1, 2, 3):
+        (tmp_path / f"p{n}.html").write_text(f"<h1>ページ{n}</h1>", encoding="utf-8")
+    out = tmp_path / "pages.csv"
+    code = main([site + "/p{1..3}.html", "--field", "t=h1", "-o", str(out), "--delay", "0"])
+    assert code == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 4  # 見出し + 3 ページ
+    assert "ページ3" in lines[3]
+
+
+def test_cli_rejects_too_many_expanded_urls(capsys):
+    code = main(["https://x.test/p{1..999}", "--field", "t=h1"])
+    assert code == 2
+    assert "上限" in capsys.readouterr().err
+
+
+def test_cli_watch_appends_without_force(site, tmp_path, capsys):
+    out = tmp_path / "watch.csv"
+    args = [site + "/index.html", "--item", "li.article", "--field", "title=h2",
+            "--every", "10m", "--times", "1", "-o", str(out), "--delay", "0"]
+    assert main(args) == 0
+    assert main(args) == 0  # 2 回目も上書き確認なしで追記される
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "fetched_at,url,title"
+    assert sum(1 for line in lines if "記事A" in line) == 2
+    assert "追記します" in capsys.readouterr().err
+
+
+def test_cli_watch_only_changes_saves_each_row_once(site, tmp_path):
+    out = tmp_path / "chg.csv"
+    args = [site + "/index.html", "--item", "li.article", "--field", "title=h2",
+            "--every", "10m", "--times", "1", "--key", "title", "--only-changes", "-o", str(out), "--delay", "0"]
+    assert main(args) == 0
+    header = out.read_text(encoding="utf-8").splitlines()[0]
+    assert header == "fetched_at,url,title,change"
+
+
+@pytest.mark.parametrize("extra, message", [
+    (["--every", "1m", "--times", "2", "-o", "x.csv"], "10 分以上"),
+    (["--every", "30m", "--times", "2"], "-o"),
+    (["--every", "30m", "--times", "2", "--for", "1h", "-o", "x.csv"], "どちらか一方"),
+    (["--only-changes", "--every", "30m", "--times", "2", "-o", "x.csv"], "--key"),
+    (["--key", "nope", "--every", "30m", "--times", "2", "-o", "x.csv"], "項目にありません"),
+])
+def test_cli_watch_validation(extra, message, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    code = main(["https://x.test/", "--field", "t=h1", *extra])
+    assert code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_cli_watch_only_changes_does_not_duplicate_across_runs(site, tmp_path):
+    out = tmp_path / "dedupe.csv"
+    args = [site + "/index.html", "--item", "li.article", "--field", "title=h2",
+            "--every", "10m", "--times", "1", "--key", "title", "--only-changes", "-o", str(out), "--delay", "0"]
+    assert main(args) == 0
+    first = out.read_text(encoding="utf-8")
+    assert main(args) == 0  # 2 回目は新規も変更もなし（保存 0 行）でも正常終了
+    assert out.read_text(encoding="utf-8") == first

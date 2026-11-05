@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import html
+import re
 import json
 import secrets
 import sys
@@ -13,14 +14,17 @@ import threading
 import urllib.parse
 import webbrowser
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from easyscrape.extract import FieldSpec
 from easyscrape.fetch import FetchError, Fetcher
 from easyscrape.picker import FRAME_CSP, sanitize, suggest
 from easyscrape.job import DETAIL_MAX, ScrapeJob, ScrapeResult, detail_targets, run_detail, run_job
-from easyscrape.output import render, warn_personal_info
+from easyscrape.output import EMAIL_RE, PHONE_RE, append_rows, guess_format, read_rows, render, warn_personal_info
+from easyscrape.urlpattern import expand_urls
+from easyscrape.watch import WatchStatus, make_plan, run_watch
 from easyscrape.cli import _parse_form, _parse_headers
 
 HOST = "127.0.0.1"
@@ -102,6 +106,11 @@ def parse_input(values: dict[str, str]) -> FormInput:
     for url in urls:
         if not url.startswith(("http://", "https://")):
             errors.append(f"http:// か https:// で始まる URL を入力してください: {url}")
+    if urls and not errors:
+        try:
+            urls = expand_urls(urls)  # {1..10} などの規則を展開する
+        except ValueError as exc:
+            errors.append(str(exc))
 
     fields_text = values.get("fields", "")
     fields: list[FieldSpec] = []
@@ -146,6 +155,114 @@ def parse_input(values: dict[str, str]) -> FormInput:
         headers=headers,
         errors=errors,
     )
+
+
+WATCH_DIR = Path.home() / "easyscrape-output"  # 繰り返し取得の保存先（ファイル名だけ画面で指定できる）
+MAX_RUNNING_WATCHES = 2
+WATCH_EVERY_CHOICES = [("10m", "10 分"), ("30m", "30 分"), ("1h", "1 時間"), ("3h", "3 時間"),
+                       ("6h", "6 時間"), ("12h", "12 時間"), ("1d", "1 日")]
+WATCH_SPAN_CHOICES = [("6h", "6 時間"), ("24h", "1 日"), ("3d", "3 日"), ("7d", "7 日")]
+_WATCH_NAME = re.compile(r"^[\w][\w.\-]{0,79}$")
+
+
+@dataclass
+class WatchHandle:
+    """画面から始めた繰り返し取得 1 件。"""
+
+    id: str
+    path: Path
+    urls: list[str]
+    status: WatchStatus
+    stop: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+
+    def running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+
+class WatchRegistry:
+    def __init__(self) -> None:
+        self._items: dict[str, WatchHandle] = {}
+        self._lock = threading.Lock()
+
+    def add(self, handle: WatchHandle) -> None:
+        with self._lock:
+            self._items[handle.id] = handle
+
+    def get(self, watch_id: str) -> WatchHandle | None:
+        with self._lock:
+            return self._items.get(watch_id)
+
+    def all(self) -> list[WatchHandle]:
+        with self._lock:
+            return list(self._items.values())
+
+    def running_count(self) -> int:
+        return sum(1 for handle in self.all() if handle.running())
+
+
+WATCHES = WatchRegistry()
+
+
+def watch_path(name: str) -> Path:
+    """保存ファイル名を検証し、WATCH_DIR 直下のパスにする（フォルダ指定や .. は受け付けない）。"""
+    name = name.strip() or "easyscrape-watch.csv"
+    if not _WATCH_NAME.match(name) or name.startswith("."):
+        raise ValueError("保存ファイル名には、文字・数字・ハイフン・ドットだけを使ってください（フォルダは指定できません）。")
+    if Path(name).suffix.lower() not in (".csv", ".json"):
+        name += ".csv"
+    return WATCH_DIR / name
+
+
+def launch_watch(values: dict[str, str], form_input: FormInput) -> tuple[WatchHandle | None, list[str]]:
+    """フォームの内容で繰り返し取得を始める。始められなければ理由を返す。"""
+    try:
+        plan = make_plan(values.get("watch_every", ""), values.get("watch_span", ""), None)
+        path = watch_path(values.get("watch_file", ""))
+    except ValueError as exc:
+        return None, [str(exc)]
+    key = values.get("watch_key", "").strip() or None
+    only_changes = bool(values.get("watch_only_changes"))
+    names = {spec.name for spec in form_input.fields} | {"url"}
+    if only_changes and not key:
+        return None, ["「変わった行だけ保存する」には、同じ行を見分ける項目名が必要です。"]
+    if key and key not in names:
+        return None, [f"見分ける項目名が、取り出す項目にありません: {key}"]
+    if WATCHES.running_count() >= MAX_RUNNING_WATCHES:
+        return None, [f"同時に動かせる繰り返し取得は {MAX_RUNNING_WATCHES} 件までです。どれかを止めてください。"]
+    try:
+        WATCH_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, [f"保存先を作れませんでした: {exc}"]
+    job = ScrapeJob(
+        urls=form_input.urls, fields=form_input.fields, item=form_input.item,
+        records=form_input.records, embedded=form_input.embedded,
+        form=form_input.form, headers=form_input.headers, delay=form_input.delay,
+    )
+    handle = WatchHandle(id=secrets.token_urlsafe(8), path=path, urls=form_input.urls, status=WatchStatus())
+    fmt = guess_format(str(path))
+    warned = False
+
+    def sink(rows: list[dict[str, str]]) -> None:
+        nonlocal warned
+        if not warned:
+            warned = True
+            if any((EMAIL_RE.search(v) or PHONE_RE.search(v)) for row in rows for v in row.values()):
+                handle.status.note("警告: メールアドレスや電話番号らしき値が含まれています。利用目的と保管方法を確認してください。")
+        append_rows(rows, str(path), fmt)
+
+    def target() -> None:
+        try:
+            run_watch(job, plan, sink, handle.status, key=key, only_changes=only_changes, stop=handle.stop,
+                      seed_rows=read_rows(str(path), fmt) if only_changes else None)
+        except Exception as exc:  # 予期しない失敗でも状態を残して終える
+            handle.status.state = "failed"
+            handle.status.note(f"予期しないエラー: {exc}")
+
+    handle.thread = threading.Thread(target=target, daemon=True)
+    WATCHES.add(handle)
+    handle.thread.start()
+    return handle, []
 
 
 class ResultStore:
@@ -477,11 +594,11 @@ PICK_SCRIPT = r"""
 """
 
 
-def _page(title: str, body: str) -> bytes:
+def _page(title: str, body: str, head_extra: str = "") -> bytes:
     doc = f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title>
+<title>{html.escape(title)}</title>{head_extra}
 <style>{STYLE}</style></head>
 <body><main>{body}</main></body></html>"""
     return doc.encode("utf-8")
@@ -489,6 +606,85 @@ def _page(title: str, body: str) -> bytes:
 
 def _esc(value: str) -> str:
     return html.escape(value, quote=True)
+
+
+EXPAND_SCRIPT = r"""
+(function () {
+  const box = document.getElementById('expand-box');
+  document.getElementById('expand-run').addEventListener('click', function () {
+    box.textContent = '確認しています…';
+    const delay = document.getElementById('delay').value || '1';
+    fetch('/expand?delay=' + encodeURIComponent(delay) + '&urls=' + encodeURIComponent(document.getElementById('urls').value),
+          { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        box.textContent = '';
+        if (data.error) { box.className = 'status warn'; box.textContent = data.error; return; }
+        box.className = 'status';
+        box.appendChild(document.createTextNode(data.count + ' 件のページを取得します（待ち時間の目安: 約 ' + data.minutes + ' 分）'));
+        const list = document.createElement('ul');
+        data.sample.forEach(function (u) {
+          const li = document.createElement('li');
+          li.textContent = u;
+          list.appendChild(li);
+        });
+        box.appendChild(list);
+        if (data.count > data.sample.length) box.appendChild(document.createTextNode('…ほか ' + (data.count - data.sample.length) + ' 件'));
+      })
+      .catch(function () { box.className = 'status warn'; box.textContent = '確認できませんでした。'; });
+  });
+})();
+"""
+
+
+def _options(choices: list[tuple[str, str]], selected: str) -> str:
+    return "".join(
+        f'<option value="{_esc(value)}"{" selected" if value == selected else ""}>{_esc(label)}</option>'
+        for value, label in choices
+    )
+
+
+_STATE_LABEL = {"waiting": "次の取得を待っています", "running": "取得中", "done": "完了",
+                "stopped": "停止しました", "failed": "エラーで止まりました"}
+
+
+def _running_watches_html() -> str:
+    items = WATCHES.all()
+    if not items:
+        return ""
+    links = "".join(
+        f'<li><a href="/watch?id={_esc(h.id)}">{_esc(h.path.name)}</a>（{_esc(_STATE_LABEL.get(h.status.state, h.status.state))}）</li>'
+        for h in items
+    )
+    return f"<section><strong>繰り返し取得の状況</strong><ul>{links}</ul></section>"
+
+
+def watch_page(handle: WatchHandle) -> bytes:
+    status = handle.status
+    active = handle.running() and status.state in ("waiting", "running")
+    messages = "".join(f"<li>{_esc(m)}</li>" for m in reversed(status.messages)) or "<li>まだありません</li>"
+    stop_form = f"""<form method="post" action="/watch/stop" style="display:inline">
+    {_hidden({"id": handle.id})}<button type="submit">停止する</button></form>""" if active else ""
+    next_line = f"<li>次の取得: {_esc(status.next_run)}</li>" if status.next_run else ""
+    body = f"""
+<h1>繰り返し取得: {_esc(_STATE_LABEL.get(status.state, status.state))}</h1>
+<section>
+  <ul>
+    <li>進み具合: {status.done} / {status.planned} 回</li>
+    <li>保存した行: {status.rows_saved} 行</li>
+    <li>前回の取得: {_esc(status.last_run) or "まだ"}</li>
+    {next_line}
+    <li>保存先: {_esc(str(handle.path))}</li>
+    <li>対象: {_esc(handle.urls[0])}{f"（ほか {len(handle.urls) - 1} 件）" if len(handle.urls) > 1 else ""}</li>
+  </ul>
+  {stop_form}
+  <a href="/">設定画面へ戻る</a>
+  <p><small>この画面を閉じても取得は続きます。easyscrape-ui を終了すると止まります。{"15 秒ごとに自動で更新します。" if active else ""}</small></p>
+</section>
+<section><strong>経過</strong><ul>{messages}</ul></section>
+"""
+    head = '<meta http-equiv="refresh" content="15">' if active else ""
+    return _page("繰り返し取得", body, head)
 
 
 def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
@@ -536,6 +732,9 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
   <h2 class="step">3. 取り出す内容</h2>
   <label for="urls">取得するページの URL（1 行に 1 つ）</label>
   <textarea id="urls" name="urls">{_esc(values.get("urls", ""))}</textarea>
+  <small>URL の一部を規則で書くと、複数のページを順に巡回します。連番: <code>https://example.com/list?page={{1..10}}</code>、ゼロ埋め: <code>{{01..12}}</code>、列挙: <code>{{tokyo,osaka}}</code>（上限 200 件）。</small>
+  <button type="button" class="sub" id="expand-run">URL の展開を確認</button>
+  <div id="expand-box" class="status"></div>
 
   <label for="embedded">埋め込みデータの場所（任意）</label>
   <input type="text" id="embedded" name="embedded" value="{_esc(values.get("embedded", ""))}">
@@ -573,9 +772,26 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
   <small>1 秒未満にはできません。サイトの robots.txt でさらに長くなる場合があります。</small>
 </details>
 <button type="submit">取得する</button>
+
+<details class="advanced" id="watch">
+  <summary>繰り返し取得（一定期間、定期的に取得して保存）</summary>
+  <small>上の設定で、決めた間隔ごとに取得し、結果をファイルに追記します。相手サイトへの負荷を抑えるため、間隔は 10 分以上、期間は最長 7 日です。この画面（easyscrape-ui）を終了すると止まります。</small>
+  <label for="watch_every">取得する間隔</label>
+  <select id="watch_every" name="watch_every">{_options(WATCH_EVERY_CHOICES, values.get("watch_every", "1h"))}</select>
+  <label for="watch_span">繰り返す期間</label>
+  <select id="watch_span" name="watch_span">{_options(WATCH_SPAN_CHOICES, values.get("watch_span", "24h"))}</select>
+  <label for="watch_file">保存ファイル名（{_esc(str(WATCH_DIR))} に保存。既にあれば追記）</label>
+  <input type="text" id="watch_file" name="watch_file" value="{_esc(values.get("watch_file", "easyscrape-watch.csv"))}">
+  <label><input type="checkbox" name="watch_only_changes" value="1"{" checked" if values.get("watch_only_changes") else ""}> 新しい行・内容が変わった行だけ保存する</label>
+  <label for="watch_key">同じ行を見分ける項目名（上の項目名か url。「変わった行だけ」を使うときに必要）</label>
+  <input type="text" id="watch_key" name="watch_key" value="{_esc(values.get("watch_key", ""))}">
+  <button type="submit" formaction="/watch/start">繰り返し取得を始める</button>
+</details>
+{_running_watches_html()}
 </form>
 <script>{PRESET_SCRIPT % json.dumps(PRESETS, ensure_ascii=False)}</script>
 <script>{PICK_SCRIPT}</script>
+<script>{EXPAND_SCRIPT}</script>
 """
     return _page("かんたんスクレイピング", body)
 
@@ -720,6 +936,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/suggest"):
             self._suggest()
             return
+        if self.path.startswith("/expand"):
+            self._expand()
+            return
+        if self.path.startswith("/watch"):
+            self._watch_status()
+            return
         self._send(404, _page("404", "<h1>404</h1>"))
 
     def _suggest(self) -> None:
@@ -736,6 +958,57 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"error": "HTML のページではないため、候補は出せません。"})
             return
         self._json(200, suggest(text))
+
+    def _expand(self) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        lines = _lines(query.get("urls", [""])[-1])
+        try:
+            delay = max(MIN_DELAY, float(query.get("delay", ["1"])[-1] or MIN_DELAY))
+        except ValueError:
+            delay = MIN_DELAY
+        if not lines:
+            self._json(200, {"error": "URL を入力してください。"})
+            return
+        bad = [line for line in lines if not line.startswith(("http://", "https://"))]
+        if bad:
+            self._json(200, {"error": f"http:// か https:// で始まる URL を入力してください: {bad[0]}"})
+            return
+        try:
+            urls = expand_urls(lines)
+        except ValueError as exc:
+            self._json(200, {"error": str(exc)})
+            return
+        # 先頭 5 件と最後の 1 件だけ見せる（長い一覧で画面を埋めない）
+        sample = urls if len(urls) <= 6 else urls[:5] + urls[-1:]
+        self._json(200, {"count": len(urls), "sample": sample, "minutes": max(1, round(len(urls) * delay / 60))})
+
+    def _watch_start(self, values: dict[str, str]) -> None:
+        form_input = parse_input(values)
+        if form_input.errors:
+            self._send(200, form_page(values, form_input.errors))
+            return
+        handle, errors = launch_watch(values, form_input)
+        if handle is None:
+            self._send(200, form_page(values, errors))
+            return
+        self._send(200, watch_page(handle))
+
+    def _watch_stop(self, values: dict[str, str]) -> None:
+        handle = WATCHES.get(values.get("id", ""))
+        if handle is None:
+            self._send(404, form_page({}, ["その繰り返し取得は見つかりません。"]))
+            return
+        handle.stop.set()
+        handle.status.note("停止を依頼しました（取得中の分が終わり次第止まります）")
+        self._send(200, watch_page(handle))
+
+    def _watch_status(self) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        handle = WATCHES.get(query.get("id", [""])[-1])
+        if handle is None:
+            self._send(404, form_page({}, ["その繰り返し取得は見つかりません。"]))
+            return
+        self._send(200, watch_page(handle))
 
     def _json(self, status: int, data: dict) -> None:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -775,6 +1048,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._download(values)
             elif self.path == "/detail":
                 self._detail(values)
+            elif self.path == "/watch/start":
+                self._watch_start(values)
+            elif self.path == "/watch/stop":
+                self._watch_stop(values)
             else:
                 self._send(404, _page("404", "<h1>404</h1>"))
         except Exception as exc:  # 予期しない失敗でも接続を切らず、理由を画面に出す

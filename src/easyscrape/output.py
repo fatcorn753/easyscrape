@@ -58,3 +58,54 @@ def write_rows(rows: list[dict[str, str]], path: str | None, fmt: str | None = N
         sys.stdout.write(text)
         return
     Path(path).write_text(text, encoding="utf-8", newline="")
+
+
+def append_rows(rows: list[dict[str, str]], path: str, fmt: str | None = None) -> None:
+    """既存ファイルの末尾に行を足す（繰り返し取得用）。無ければ新規に作る。
+
+    CSV は見出し行が同じときだけ追記する。JSON は配列を読み直して足し、一時ファイル経由で置き換える。
+    """
+    if not rows:
+        return
+    target = Path(path)
+    fmt = fmt or guess_format(path)
+    if fmt == "csv":
+        columns = list(rows[0].keys())
+        exists = target.exists() and target.stat().st_size > 0
+        if exists:
+            with target.open(encoding="utf-8", newline="") as handle:
+                header = next(csv.reader(handle), [])
+            if header != columns:
+                raise ValueError(f"既存ファイルの列が今回と違います（既存: {','.join(header)}）。別のファイル名にしてください。")
+        with target.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            if not exists:
+                writer.writeheader()
+            writer.writerows(rows)
+        return
+    if fmt == "json":
+        existing: list = []
+        if target.exists() and target.stat().st_size > 0:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                raise ValueError("既存の JSON ファイルが配列ではありません。別のファイル名にしてください。")
+        temp = target.with_name(target.name + ".tmp")
+        temp.write_text(json.dumps(existing + rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="")
+        temp.replace(target)
+        return
+    raise ValueError(f"未対応の形式: {fmt}")
+
+
+def read_rows(path: str, fmt: str | None = None) -> list[dict[str, str]]:
+    """保存済みのファイルから行を読む。無い・空・壊れている場合は空のリスト。"""
+    target = Path(path)
+    if not target.exists() or target.stat().st_size == 0:
+        return []
+    try:
+        if (fmt or guess_format(path)) == "json":
+            data = json.loads(target.read_text(encoding="utf-8"))
+            return [{k: str(v) for k, v in row.items()} for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        with target.open(encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
