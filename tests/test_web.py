@@ -320,6 +320,15 @@ def test_detail_bad_input_shows_error_and_keeps_confirm(ui, detail_site):
     assert "詳細ページも取得しますか" in body  # 確認を出し直す
 
 
+def test_result_page_shows_check_list(ui, target):
+    _, _, body = _request(ui, "POST", "/run", {
+        "urls": f"{target}/list.html", "item": "li.item", "fields": "title=h2", "delay": "1",
+    })
+    assert "保存する前に確認" in body
+    assert "取得元のページ数: <strong>1</strong>" in body
+    assert "3〜5 行を選び" in body
+
+
 def test_detail_targets_filters_host_prefix_and_limit():
     from easyscrape.job import detail_targets
 

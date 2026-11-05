@@ -617,9 +617,19 @@ def result_page(values: dict[str, str], result: ScrapeResult, token: str) -> byt
         table = "<p>取得できた行はありませんでした。項目の場所やセレクタを確認してください。</p>"
         preview_note = ""
     detail_block = _detail_block(values, result, token)
+    pages = len({row.get("url", "") for row in rows if row.get("url")})
+    check_html = f"""<section class="check">
+  <h2 class="step">保存する前に確認</h2>
+  <ul>
+    <li>取得元のページ数: <strong>{pages}</strong>（取得に成功した URL の数）</li>
+    <li>行数が、元のページに見えている件数と合うか</li>
+    <li>下の表から 3〜5 行を選び、元のページの値と見比べる（行が混ざる・抜けるなど）</li>
+  </ul>
+</section>""" if rows else ""
     body = f"""
 <h1>取得結果: {len(rows)} 行</h1>
 {errors_html}
+{check_html}
 <section>
   <form method="post" action="/download" style="display:inline">
     {_hidden({"token": token, "format": "csv"})}
