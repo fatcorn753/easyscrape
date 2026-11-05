@@ -241,7 +241,7 @@ def test_crawl_delay_respected():
     parser = urllib.robotparser.RobotFileParser()
     parser.parse(["User-agent: *", "Crawl-delay: 20"])
     fetcher._robots["https://example.test"] = parser
-    assert fetcher._interval("https://example.test/a") == 20.0
+    assert fetcher.interval("https://example.test/a") == 20.0
 
 
 def test_decode_body_charsets():
@@ -298,3 +298,53 @@ def test_output_to_directory_is_clean_error(site, tmp_path, capsys):
     code = main([site + "/index.html", "--field", "title=h2", "-o", str(tmp_path), "--force", "--delay", "0"])
     assert code == 2
     assert "保存できませんでした" in capsys.readouterr().err
+
+
+EMBED_HTML = """<html><head>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"items":[{"name":"商品A","price":500},{"name":"商品B","price":1200}]}}}</script>
+</head><body><p>本文</p></body></html>"""
+
+
+def test_extract_embedded_rows_next_data():
+    from easyscrape.extract import extract_embedded_rows
+
+    rows = extract_embedded_rows(
+        EMBED_HTML,
+        [FieldSpec.parse("name=name"), FieldSpec.parse("price=price")],
+        "script#__NEXT_DATA__",
+        "props.pageProps.items",
+    )
+    assert rows == [{"name": "商品A", "price": "500"}, {"name": "商品B", "price": "1200"}]
+
+
+def test_embedded_errors_are_value_errors():
+    from easyscrape.extract import extract_embedded_rows
+
+    with pytest.raises(ValueError, match="見つかりません"):
+        extract_embedded_rows(EMBED_HTML, [FieldSpec.parse("n=name")], "script#missing", None)
+    with pytest.raises(ValueError, match="JSON ではありません"):
+        extract_embedded_rows("<script id='x'>not json</script>", [FieldSpec.parse("n=name")], "script#x", None)
+
+
+def test_job_with_embedded_source(tmp_path):
+    from easyscrape.job import ScrapeJob, run_job
+
+    (tmp_path / "embed.html").write_text(EMBED_HTML, encoding="utf-8")
+    handler = partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
+    handler.log_message = lambda *a, **k: None
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/embed.html"
+        result = run_job(ScrapeJob(
+            urls=[url],
+            fields=[FieldSpec.parse("name=name")],
+            embedded="script#__NEXT_DATA__",
+            records="props.pageProps.items",
+            delay=0,
+        ))
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.errors == []
+    assert [r["name"] for r in result.rows] == ["商品A", "商品B"]

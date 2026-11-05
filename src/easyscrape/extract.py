@@ -97,6 +97,23 @@ def looks_like_json(text: str, content_type: str) -> bool:
     return text.lstrip()[:1] in ("{", "[")
 
 
+def extract_embedded_rows(
+    html: str, fields: list[FieldSpec], script_selector: str, records_path: str | None
+) -> list[dict[str, str]]:
+    """HTML に埋め込まれた JSON（<script id="__NEXT_DATA__"> や JSON-LD など）から行を取り出す。
+
+    script_selector で埋め込み先の <script> を指定する。中身が JSON でなければ ValueError。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    node = _select(soup, script_selector)
+    if node is None:
+        raise ValueError(f"埋め込みデータが見つかりません: {script_selector}")
+    try:
+        return extract_json_rows(node.string or node.get_text(), fields, records_path)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"埋め込みデータが JSON ではありません: {script_selector}") from exc
+
+
 def extract_json_rows(text: str, fields: list[FieldSpec], records_path: str | None) -> list[dict[str, str]]:
     """JSON から行を取り出す。
 

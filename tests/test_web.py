@@ -224,7 +224,7 @@ def test_suggest_no_repeat_returns_none():
     from easyscrape.picker import suggest
 
     result = suggest("<html><body><p>ひとつだけ</p></body></html>")
-    assert result == {"candidates": []}
+    assert result == {"candidates": [], "embedded": []}
 
 
 def test_suggest_route_json(ui, target):
@@ -244,3 +244,75 @@ def test_form_has_guided_sections_and_public_presets(ui):
     assert "候補を自動で探す" in body
     assert "総務省 報道資料一覧" in body
     assert "<details class=\"advanced\">" in body
+
+
+def test_submit_button_is_outside_advanced_details(ui):
+    _, _, body = _request(ui, "GET", "/")
+    assert body.index("</details>") < body.index('<button type="submit">取得する</button>')
+    assert body.index('<details class="advanced">') < body.index("</details>")
+
+
+DETAIL_LIST = """<html><body>
+<div class="item"><h2>記事1の見出し</h2><a href="/news/d1.html">続き</a></div>
+<div class="item"><h2>記事2の見出し</h2><a href="/news/d2.html">続き</a></div>
+<div class="item"><h2>外部の記事</h2><a href="https://other.example/x.html">続き</a></div>
+</body></html>"""
+
+
+@pytest.fixture
+def detail_site(tmp_path):
+    (tmp_path / "news").mkdir()
+    (tmp_path / "news" / "list.html").write_text(DETAIL_LIST, encoding="utf-8")
+    (tmp_path / "news" / "d1.html").write_text("<h1>詳細1の本文</h1>", encoding="utf-8")
+    (tmp_path / "news" / "d2.html").write_text("<h1>詳細2の本文</h1>", encoding="utf-8")
+    handler = partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
+    handler.log_message = lambda *a, **k: None
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_detail_flow_confirm_then_fetch(ui, detail_site):
+    values = {
+        "urls": f"{detail_site}/news/list.html",
+        "item": "div.item",
+        "fields": "title=h2\nlink=a@href",
+        "detailfield": "link",
+        "delay": "1",
+    }
+    status, _, body = _request(ui, "POST", "/run", values)
+    assert status == 200
+    assert "詳細ページも取得しますか" in body
+    assert "同じサイト内の詳細ページ <strong>2 件</strong>" in body  # 外部サイトの 1 件は除外
+    token = re.search(r'name="token" value="([^"]+)"', body.split('action="/detail"')[1]).group(1)
+
+    status, _, body = _request(ui, "POST", "/detail", {
+        "token": token,
+        "detailfield": "link",
+        "delay": "1",
+        "fields": "body=h1",
+        "limit": "10",
+    })
+    assert status == 200
+    assert "詳細1の本文" in body
+    assert "詳細2の本文" in body
+    assert "詳細ページも取得しますか" not in body
+
+
+def test_detail_targets_filters_host_prefix_and_limit():
+    from easyscrape.job import detail_targets
+
+    rows = [
+        {"url": "https://a.example/news/list.html", "link": "https://a.example/news/1.html"},
+        {"url": "https://a.example/news/list.html", "link": "https://a.example/news/1.html"},
+        {"url": "https://a.example/news/list.html", "link": "https://a.example/other/2.html"},
+        {"url": "https://a.example/news/list.html", "link": "https://b.example/news/3.html"},
+        {"url": "https://a.example/news/list.html", "link": "https://a.example/news/4.html"},
+    ]
+    assert detail_targets(rows, "link", 10) == [
+        "https://a.example/news/1.html",
+        "https://a.example/news/4.html",
+    ]
+    assert detail_targets(rows, "link", 1) == ["https://a.example/news/1.html"]

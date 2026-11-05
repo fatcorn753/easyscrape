@@ -104,7 +104,8 @@ class Fetcher:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise FetchError(f"取得失敗: {url} ({exc})") from exc
 
-    def _interval(self, url: str) -> float:
+    def interval(self, url: str) -> float:
+        """このホストへの次のアクセスまでの待ち時間（robots.txt の Crawl-delay を含む）。"""
         parser = self._robots_for(url)
         crawl_delay = parser.crawl_delay(USER_AGENT) if parser is not None else None
         return max(self.delay, float(crawl_delay or 0))
@@ -113,7 +114,7 @@ class Fetcher:
         host = urllib.parse.urlsplit(url).netloc
         last = self._last_request.get(host)
         if last is not None:
-            remaining = self._interval(url) - (time.monotonic() - last)
+            remaining = self.interval(url) - (time.monotonic() - last)
             if remaining > 0:
                 time.sleep(remaining)
         self._last_request[host] = time.monotonic()

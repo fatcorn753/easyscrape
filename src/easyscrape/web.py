@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from easyscrape.extract import FieldSpec
 from easyscrape.fetch import FetchError, Fetcher
 from easyscrape.picker import FRAME_CSP, sanitize, suggest
-from easyscrape.job import ScrapeJob, ScrapeResult, run_job
+from easyscrape.job import DETAIL_MAX, ScrapeJob, ScrapeResult, detail_targets, run_detail, run_job
 from easyscrape.output import render, warn_personal_info
 from easyscrape.cli import _parse_form, _parse_headers
 
@@ -78,6 +78,7 @@ class FormInput:
     item: str | None
     fields_text: str
     records: str | None
+    embedded: str | None
     data_text: str
     headers_text: str
     delay: float
@@ -136,6 +137,7 @@ def parse_input(values: dict[str, str]) -> FormInput:
         item=values.get("item", "").strip() or None,
         fields_text=fields_text,
         records=values.get("records", "").strip() or None,
+        embedded=values.get("embedded", "").strip() or None,
         data_text=data_text,
         headers_text=headers_text,
         delay=delay,
@@ -285,6 +287,20 @@ PICK_SCRIPT = r"""
       return;
     }
     const candidates = data.candidates || [];
+    if (data.embedded && data.embedded.length) {
+      const line = el('p', '埋め込みデータが見つかりました。使う場合は下のボタンを押してください（場所の設定は詳細設定の JSON の場所も合わせて入れます）:');
+      suggestBox.appendChild(line);
+      data.embedded.forEach(function (sel) {
+        const b = el('button', sel);
+        b.type = 'button';
+        b.className = 'sub';
+        b.addEventListener('click', function () {
+          document.getElementById('embedded').value = sel;
+          say('埋め込みデータの場所を設定しました: ' + sel + '（JSON の配列の場所は詳細設定の「JSON の場合」に入れてください）');
+        });
+        suggestBox.appendChild(b);
+      });
+    }
     if (!candidates.length) {
       suggestBox.appendChild(el('p', '一覧を自動で見つけられませんでした。' +
         'ページを開いて「一覧の 1 件」をクリックするか、サンプルを試してください。' +
@@ -499,6 +515,10 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
   <label for="urls">取得するページの URL（1 行に 1 つ）</label>
   <textarea id="urls" name="urls">{_esc(values.get("urls", ""))}</textarea>
 
+  <label for="embedded">埋め込みデータの場所（任意）</label>
+  <input type="text" id="embedded" name="embedded" value="{_esc(values.get("embedded", ""))}">
+  <small>ページ内に JSON で商品や記事の一覧が入っている場合の場所（例: <code>script#__NEXT_DATA__</code>）。入っていれば、下の「一覧の 1 件」と HTML の項目は使わず、JSON から取ります。「候補を探す」で見つかれば自動で入ります。</small>
+
   <label for="item">一覧の 1 件（任意）</label>
   <input type="text" id="item" name="item" value="{_esc(values.get("item", ""))}">
   <small>同じ形で並ぶ 1 件分の目印。一覧でない単独のページなら空欄のまま。</small>
@@ -506,6 +526,10 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
   <label for="fields">取り出す項目（1 行に 1 つ）</label>
   <textarea id="fields" name="fields">{_esc(values.get("fields", ""))}</textarea>
   <small>書き方: <code>項目名=場所</code>。例: <code>title=h2</code>、リンクは <code>link=a@href</code>。</small>
+
+  <label for="detailfield">詳細ページも取る場合: 詳細ページのリンクの項目名（任意）</label>
+  <input type="text" id="detailfield" name="detailfield" value="{_esc(values.get("detailfield", ""))}">
+  <small>一覧の項目にリンク（例: <code>link=a@href</code>）を入れたら、その項目名を書く。取得後に詳細ページの確認が出ます。</small>
 </section>
 
 <details class="advanced">
@@ -525,7 +549,7 @@ def form_page(values: dict[str, str], errors: list[str] | None = None) -> bytes:
   <label for="delay">同じサイトへの待ち時間（秒）</label>
   <input type="number" id="delay" name="delay" min="1" step="0.5" value="{_esc(values.get("delay", "1"))}">
   <small>1 秒未満にはできません。サイトの robots.txt でさらに長くなる場合があります。</small>
-</section>
+</details>
 <button type="submit">取得する</button>
 </form>
 <script>{PRESET_SCRIPT % json.dumps(PRESETS, ensure_ascii=False)}</script>
@@ -543,6 +567,33 @@ def _hidden(values: dict[str, str]) -> str:
     return "".join(
         f'<input type="hidden" name="{_esc(k)}" value="{_esc(v)}">' for k, v in values.items()
     )
+
+
+def _detail_block(values: dict[str, str], result: ScrapeResult, token: str) -> str:
+    """詳細ページを取るかどうかの確認。件数と時間の目安を出してから実行させる。"""
+    column = values.get("detailfield", "").strip()
+    if not column or values.get("detail_done") or not result.rows or column not in result.rows[0]:
+        return ""
+    targets = detail_targets(result.rows, column, DETAIL_MAX)
+    if not targets:
+        return '<section><p class="status warn">詳細ページの URL が見つかりませんでした。同じサイト内の一覧リンクか確認してください。</p></section>'
+    seconds = PICK_FETCHER.interval(targets[0]) * len(targets)
+    minutes = max(1, round(seconds / 60))
+    return f"""
+<section>
+  <h2 class="step">詳細ページも取得しますか？</h2>
+  <p>同じサイト内の詳細ページ <strong>{len(targets)} 件</strong>を開きます（上限 {DETAIL_MAX} 件）。
+  待ち時間の目安は約 <strong>{minutes} 分</strong>です。</p>
+  <form method="post" action="/detail">
+    {_hidden({"token": token, "detailfield": column, "delay": values.get("delay", "1")})}
+    <label for="dfields">詳細ページから取る項目（1 行に 1 つ）</label>
+    <textarea id="dfields" name="fields" placeholder="例: body=.article-body"></textarea>
+    <small>書き方: <code>項目名=場所</code>。詳細ページの見出しや本文の場所を書きます。</small>
+    <label for="dlimit">最大件数</label>
+    <input type="number" id="dlimit" name="limit" min="1" max="{DETAIL_MAX}" value="{min(30, DETAIL_MAX)}">
+    <button type="submit">詳細ページを取得する</button>
+  </form>
+</section>"""
 
 
 def result_page(values: dict[str, str], result: ScrapeResult, token: str) -> bytes:
@@ -565,6 +616,7 @@ def result_page(values: dict[str, str], result: ScrapeResult, token: str) -> byt
     else:
         table = "<p>取得できた行はありませんでした。項目の場所やセレクタを確認してください。</p>"
         preview_note = ""
+    detail_block = _detail_block(values, result, token)
     body = f"""
 <h1>取得結果: {len(rows)} 行</h1>
 {errors_html}
@@ -586,6 +638,7 @@ def result_page(values: dict[str, str], result: ScrapeResult, token: str) -> byt
   {preview_note}
   {table}
 </section>
+{detail_block}
 """
     return _page("取得結果", body)
 
@@ -688,6 +741,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._run(values)
             elif self.path == "/download":
                 self._download(values)
+            elif self.path == "/detail":
+                self._detail(values)
             else:
                 self._send(404, _page("404", "<h1>404</h1>"))
         except Exception as exc:  # 予期しない失敗でも接続を切らず、理由を画面に出す
@@ -704,6 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             fields=form_input.fields,
             item=form_input.item,
             records=form_input.records,
+            embedded=form_input.embedded,
             form=form_input.form,
             headers=form_input.headers,
             delay=form_input.delay,
@@ -712,6 +768,25 @@ class Handler(BaseHTTPRequestHandler):
         warn_personal_info(result.rows, stream=sys.stderr)
         token = STORE.put(result)
         self._send(200, result_page(values, result, token))
+
+    def _detail(self, values: dict[str, str]) -> None:
+        stored = STORE.get(values.get("token", ""))
+        if stored is None:
+            self._send(404, form_page({}, ["保存できる結果がありません（期限切れ）。もう一度取得してください。"]))
+            return
+        column = values.get("detailfield", "").strip()
+        try:
+            fields = [FieldSpec.parse(line) for line in _lines(values.get("fields", ""))]
+            if not fields:
+                raise ValueError("詳細ページから取る項目を 1 つ以上入力してください。")
+            limit = max(1, min(int(values.get("limit") or 30), DETAIL_MAX))
+        except ValueError as exc:
+            self._send(200, result_page(dict(values, detail_done=""), stored, values.get("token", "")))
+            return
+        result = run_detail(stored.rows, column, fields, PICK_FETCHER, limit)
+        token = STORE.put(result)
+        page_values = {"detailfield": column, "delay": values.get("delay", "1"), "detail_done": "1"}
+        self._send(200, result_page(page_values, result, token))
 
     def _download(self, values: dict[str, str]) -> None:
         result = STORE.get(values.get("token", ""))

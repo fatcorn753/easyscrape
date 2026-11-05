@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="追加の HTTP ヘッダー（例: 'X-Requested-With: XMLHttpRequest'）",
     )
     parser.add_argument(
+        "--embedded",
+        metavar="セレクタ",
+        help="HTML 内の埋め込み JSON の場所（例: script#__NEXT_DATA__）。--records と --field はその JSON 内の位置",
+    )
+    parser.add_argument(
         "--records",
         metavar="パス",
         help="JSON 応答で行の配列を指すドット区切りのパス（例: result.all）",
@@ -117,6 +122,7 @@ def interactive_config() -> argparse.Namespace:
         data=[],
         header=[],
         records=None,
+        embedded=None,
     )
 
 
@@ -149,6 +155,7 @@ def run(args: argparse.Namespace) -> int:
         fields=fields,
         item=args.item,
         records=args.records,
+        embedded=args.embedded,
         form=form,
         headers=headers,
         delay=args.delay,

@@ -407,6 +407,24 @@ def _fields_for(members: list[Tag]) -> list[dict]:
     return fields
 
 
+def _embedded_candidates(soup: BeautifulSoup) -> list[str]:
+    """埋め込み JSON の場所の候補（script#id、または JSON-LD）。"""
+    found: list[str] = []
+    for script in soup.find_all("script"):
+        script_id = script.get("id")
+        if script_id and _CLASS_OK.match(script_id):
+            sel = f"script#{script_id}"
+        elif (script.get("type") or "").lower() == "application/ld+json":
+            sel = 'script[type="application/ld+json"]'
+        else:
+            continue
+        if sel not in found:
+            found.append(sel)
+        if len(found) >= 3:
+            break
+    return found
+
+
 def suggest(html: str) -> dict:
     """一覧の候補（繰り返し要素）と、各候補で取り出せる項目を返す。
 
@@ -435,6 +453,7 @@ def suggest(html: str) -> dict:
                 scored.append((doc_filled, sig, total))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    embedded = _embedded_candidates(soup)
     candidates = []
     for _, sig, members in scored[:SUGGEST_MAX_CANDIDATES * 3]:
         fields = _fields_for(members)
@@ -443,4 +462,4 @@ def suggest(html: str) -> dict:
         candidates.append({"item": sig, "count": len(members), "fields": fields})
         if len(candidates) >= SUGGEST_MAX_CANDIDATES:
             break
-    return {"candidates": candidates}
+    return {"candidates": candidates, "embedded": embedded}
