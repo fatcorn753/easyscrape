@@ -349,3 +349,68 @@ def test_detail_targets_filters_host_prefix_and_limit():
         "https://a.example/news/4.html",
     ]
     assert detail_targets(rows, "link", 1) == ["https://a.example/news/1.html"]
+
+
+RANK_HTML = (
+    "<html><body><main><ul>"
+    + "".join(f"<li><a href='/x{i}'>関連リンクその{i}</a></li>" for i in range(8))
+    + "</ul><table>"
+    + "".join(
+        f"<tr><td class='d'>2026年11月{i}日</td><td><a href='/n{i}'>発表のタイトル{i}</a></td><td>担当部局{i}</td></tr>"
+        for i in range(1, 5)
+    )
+    + "</table></main></body></html>"
+)
+
+
+def test_suggest_prefers_richer_candidate_over_bigger_link_list():
+    from easyscrape.picker import suggest
+
+    candidates = suggest(RANK_HTML)["candidates"]
+    assert candidates[0]["item"] == "tr"
+    assert candidates[0]["count"] == 4
+    assert any(c["item"] == "li" for c in candidates)  # 件数が多い方も候補には残る
+
+
+def test_suggest_embedded_finds_records_path_and_fields():
+    from easyscrape.extract import FieldSpec, extract_embedded_rows
+    from easyscrape.picker import suggest
+
+    html = (
+        '<html><body><script id="__NEXT_DATA__" type="application/json">'
+        '{"props":{"pageProps":{"user":{"id":1,"name":"x"},"items":['
+        '{"id":"a1","title":"商品A","price":500,"seller":{"name":"店A","@id":"z"},"tags":["x"]},'
+        '{"id":"a2","title":"商品B","price":1200,"seller":{"name":"店B"},"tags":[]},'
+        '{"id":"a3","title":"商品C","price":300,"seller":{"name":"店C"},"tags":[]}]}}}'
+        "</script></body></html>"
+    )
+    embedded = suggest(html)["embedded"]
+    assert len(embedded) == 1
+    found = embedded[0]
+    assert found["selector"] == "script#__NEXT_DATA__"
+    assert found["records"] == "props.pageProps.items"
+    assert found["count"] == 3
+    names = {f["name"]: f["selector"] for f in found["fields"]}
+    assert names["title"] == "title" and names["price"] == "price"
+    assert names["name"] == "seller.name"
+    assert "tags" not in names and "@id" not in names  # 配列と、パスに使えないキーは除く
+    # 提案をそのまま使って取得できる
+    fields = [FieldSpec.parse(f"{f['name']}={f['selector']}") for f in found["fields"]]
+    rows = extract_embedded_rows(html, fields, found["selector"], found["records"])
+    assert [r["title"] for r in rows] == ["商品A", "商品B", "商品C"]
+
+
+def test_suggest_embedded_json_ld_root_list_and_skips_useless():
+    from easyscrape.picker import suggest
+
+    ld = (
+        '<script type="application/ld+json">{"@type":"ItemList","itemListElement":['
+        '{"name":"A","url":"/a"},{"name":"B","url":"/b"}]}</script>'
+    )
+    found = suggest(f"<html><body>{ld}</body></html>")["embedded"]
+    assert found[0]["selector"] == 'script[type="application/ld+json"]'
+    assert found[0]["records"] == "itemListElement"
+    useless = '<script id="cfg" type="application/json">{"a":1,"b":[1,2,3]}</script>'
+    assert suggest(f"<html><body>{useless}</body></html>")["embedded"] == []
+    broken = '<script id="bad">not json</script>'
+    assert suggest(f"<html><body>{broken}</body></html>")["embedded"] == []

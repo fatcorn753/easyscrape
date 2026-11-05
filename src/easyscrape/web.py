@@ -292,20 +292,38 @@ PICK_SCRIPT = r"""
     }
     const candidates = data.candidates || [];
     if (data.embedded && data.embedded.length) {
-      const line = el('p', '埋め込みデータが見つかりました。使う場合は下のボタンを押してください（場所の設定は詳細設定の JSON の場所も合わせて入れます）:');
-      suggestBox.appendChild(line);
-      data.embedded.forEach(function (sel) {
-        const b = el('button', sel);
-        b.type = 'button';
-        b.className = 'sub';
-        b.addEventListener('click', function () {
-          document.getElementById('embedded').value = sel;
-          say('埋め込みデータの場所を設定しました: ' + sel + '（JSON の配列の場所は詳細設定の「JSON の場合」に入れてください）');
+      suggestBox.appendChild(el('p', 'ページの中に一覧のデータ（JSON）が見つかりました。使う場合は「このデータを使う」を押してください。'));
+      data.embedded.forEach(function (e) {
+        const box = el('div', undefined, 'table-wrap');
+        box.appendChild(el('p', e.selector + ' の中の ' + e.count + ' 件'));
+        const table = el('table');
+        const head = el('tr');
+        ['項目名', '例（1 件目）'].forEach(function (t) { head.appendChild(el('th', t)); });
+        table.appendChild(el('thead')).appendChild(head);
+        const body = el('tbody');
+        e.fields.forEach(function (f) {
+          const tr = el('tr');
+          tr.appendChild(el('td', f.name));
+          tr.appendChild(el('td', f.preview));
+          body.appendChild(tr);
         });
-        suggestBox.appendChild(b);
+        table.appendChild(body);
+        box.appendChild(table);
+        const use = el('button', 'このデータを使う');
+        use.type = 'button';
+        use.className = 'sub';
+        use.addEventListener('click', function () {
+          document.getElementById('embedded').value = e.selector;
+          document.getElementById('records').value = e.records;
+          fieldsBox.value = e.fields.map(function (f) { return f.name + '=' + f.selector; }).join('\n');
+          say('埋め込みデータを設定しました（' + e.count + ' 件）。不要な項目は「3」の欄で消せます');
+        });
+        box.appendChild(use);
+        suggestBox.appendChild(box);
       });
     }
     if (!candidates.length) {
+      if (data.embedded && data.embedded.length) return;  // 埋め込みデータを案内済みなので、見つからない旨は出さない
       suggestBox.appendChild(el('p', '一覧を自動で見つけられませんでした。' +
         'ページを開いて「一覧の 1 件」をクリックするか、サンプルを試してください。' +
         '（JavaScript で後から表示されるページは取れない場合があります）', 'status warn'));

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 from bs4 import BeautifulSoup, Tag
@@ -366,6 +367,12 @@ def _field_candidates(first: Tag) -> list[tuple[str, str | None, Tag]]:
 
 
 SUGGEST_MAX_CANDIDATES = 3
+RANK_MIN_COUNT_RATIO = 0.25
+
+
+def _kinds(candidate: dict) -> int:
+    """候補の項目の種類数（title / link / image / text）。"""
+    return len({re.sub(r"\d+$", "", f["name"]) for f in candidate["fields"]})
 
 
 def _fields_for(members: list[Tag]) -> list[dict]:
@@ -407,9 +414,102 @@ def _fields_for(members: list[Tag]) -> list[dict]:
     return fields
 
 
-def _embedded_candidates(soup: BeautifulSoup) -> list[str]:
-    """埋め込み JSON の場所の候補（script#id、または JSON-LD）。"""
-    found: list[str] = []
+EMBEDDED_MAX_BYTES = 5_000_000
+EMBEDDED_MAX_FIELDS = 12
+_KEY_OK = re.compile(r"^[^=@\s.]+$")  # FieldSpec や JSON のパス区切りと衝突する文字を含むキーは使わない
+
+
+def _scalar(value: object) -> bool:
+    return isinstance(value, (str, int, float, bool))
+
+
+def _record_lists(data: object, path: str = "", depth: int = 0, budget: list[int] | None = None):
+    """JSON の中の「オブジェクトが並ぶ配列」を (パス, 配列) で列挙する。"""
+    if budget is None:
+        budget = [20000]
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 8:
+        return
+    if isinstance(data, list):
+        if len(data) >= 2 and all(isinstance(x, dict) for x in data[:50]):
+            yield path, data
+        for index, item in enumerate(data[:5]):
+            yield from _record_lists(item, f"{path}.{index}" if path else str(index), depth + 1, budget)
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(key, str) and "." not in key:
+                yield from _record_lists(value, f"{path}.{key}" if path else key, depth + 1, budget)
+
+
+def _json_fields(records: list[dict]) -> list[dict]:
+    """配列の各要素から、全体の 8 割以上で値がある項目（1 段下までの入れ子を含む）を返す。"""
+    order: list[str] = []
+    for record in records[:50]:
+        for key, value in record.items():
+            if not isinstance(key, str) or not _KEY_OK.match(key):
+                continue
+            paths = [key] if _scalar(value) else (
+                [f"{key}.{k}" for k, v in value.items() if isinstance(k, str) and _KEY_OK.match(k) and _scalar(v)]
+                if isinstance(value, dict) else []
+            )
+            for path in paths:
+                if path not in order:
+                    order.append(path)
+    fields: list[dict] = []
+    names: set[str] = set()
+    sample = records[:200]
+    for path in order:
+        hits, preview = 0, ""
+        for record in sample:
+            value = record
+            for part in path.split("."):
+                value = value.get(part) if isinstance(value, dict) else None
+            if _scalar(value) and str(value) != "":
+                hits += 1
+                if not preview:
+                    preview = str(value)[:40]
+        if hits < max(1, int(len(sample) * 0.8)):
+            continue
+        name = path.rsplit(".", 1)[-1]
+        if name in names:
+            name = path.replace(".", "_")
+        if name in names:
+            continue
+        names.add(name)
+        fields.append({"name": name, "selector": path, "attr": None, "preview": preview, "coverage": hits})
+        if len(fields) >= EMBEDDED_MAX_FIELDS:
+            break
+    return fields
+
+
+def _embedded_analysis(node: Tag) -> dict | None:
+    """埋め込み JSON の中から、一覧に使えそうな配列（場所と項目）を見つける。"""
+    text = node.string or node.get_text()
+    if not text or len(text) > EMBEDDED_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    best = None
+    for path, records in _record_lists(data):
+        fields = _json_fields(records)
+        if len(fields) < 2:
+            continue
+        # 件数と項目数が多い配列ほど、本体の一覧である可能性が高い
+        score = (len(fields), len(records))
+        if best is None or score > best[0]:
+            best = (score, path, records, fields)
+    if best is None:
+        return None
+    _, path, records, fields = best
+    return {"records": path, "count": len(records), "fields": fields}
+
+
+def _embedded_candidates(soup: BeautifulSoup) -> list[dict]:
+    """埋め込み JSON の候補。場所（script のセレクタ）、配列の場所、項目をまとめて返す。"""
+    found: list[dict] = []
+    seen: set[str] = set()
     for script in soup.find_all("script"):
         script_id = script.get("id")
         if script_id and _CLASS_OK.match(script_id):
@@ -418,8 +518,15 @@ def _embedded_candidates(soup: BeautifulSoup) -> list[str]:
             sel = 'script[type="application/ld+json"]'
         else:
             continue
-        if sel not in found:
-            found.append(sel)
+        if sel in seen:
+            continue
+        seen.add(sel)
+        # 取得時は select_one で最初の 1 つを読むので、解析も同じ要素で行う
+        node = soup.select_one(sel)
+        analysis = _embedded_analysis(node) if node is not None else None
+        if analysis is None:
+            continue  # 一覧に使える配列が無い埋め込みデータは出さない
+        found.append({"selector": sel, **analysis})
         if len(found) >= 3:
             break
     return found
@@ -454,12 +561,14 @@ def suggest(html: str) -> dict:
 
     scored.sort(key=lambda x: x[0], reverse=True)
     embedded = _embedded_candidates(soup)
-    candidates = []
+    ranked = []
     for _, sig, members in scored[:SUGGEST_MAX_CANDIDATES * 3]:
         fields = _fields_for(members)
-        if not fields:
-            continue  # 取り出せる項目が無い候補は出さない
-        candidates.append({"item": sig, "count": len(members), "fields": fields})
-        if len(candidates) >= SUGGEST_MAX_CANDIDATES:
-            break
-    return {"candidates": candidates, "embedded": embedded}
+        if fields:  # 取り出せる項目が無い候補は出さない
+            ranked.append({"item": sig, "count": len(members), "fields": fields})
+    # 件数が多くても項目が少ないもの（ナビや補助リスト）は後ろへ。
+    # 項目の種類（見出し・リンク・文字・画像）が多い候補を先に出す。件数が極端に少ないものは除く。
+    if ranked:
+        floor = max(ranked, key=lambda c: c["count"])["count"] * RANK_MIN_COUNT_RATIO
+        ranked.sort(key=lambda c: (c["count"] >= floor, _kinds(c)), reverse=True)
+    return {"candidates": ranked[:SUGGEST_MAX_CANDIDATES], "embedded": embedded}
