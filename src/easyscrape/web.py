@@ -781,7 +781,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("詳細ページから取る項目を 1 つ以上入力してください。")
             limit = max(1, min(int(values.get("limit") or 30), DETAIL_MAX))
         except ValueError as exc:
-            self._send(200, result_page(dict(values, detail_done=""), stored, values.get("token", "")))
+            # 入力の誤りを結果画面に出し、詳細ページの確認をもう一度出す（同じ token で再入力できる）
+            shown = ScrapeResult(rows=stored.rows, errors=[str(exc)])
+            self._send(200, result_page(dict(values, detail_done=""), shown, values.get("token", "")))
             return
         result = run_detail(stored.rows, column, fields, PICK_FETCHER, limit)
         token = STORE.put(result)

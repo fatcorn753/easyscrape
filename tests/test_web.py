@@ -301,6 +301,25 @@ def test_detail_flow_confirm_then_fetch(ui, detail_site):
     assert "詳細ページも取得しますか" not in body
 
 
+def test_detail_bad_input_shows_error_and_keeps_confirm(ui, detail_site):
+    values = {
+        "urls": f"{detail_site}/news/list.html",
+        "item": "div.item",
+        "fields": "title=h2\nlink=a@href",
+        "detailfield": "link",
+        "delay": "1",
+    }
+    _, _, body = _request(ui, "POST", "/run", values)
+    token = re.search(r'name="token" value="([^"]+)"', body.split('action="/detail"')[1]).group(1)
+
+    status, _, body = _request(ui, "POST", "/detail", {
+        "token": token, "detailfield": "link", "delay": "1", "fields": "", "limit": "10",
+    })
+    assert status == 200
+    assert "詳細ページから取る項目を 1 つ以上" in body
+    assert "詳細ページも取得しますか" in body  # 確認を出し直す
+
+
 def test_detail_targets_filters_host_prefix_and_limit():
     from easyscrape.job import detail_targets
 
